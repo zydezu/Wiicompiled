@@ -34,7 +34,17 @@ extern "C" uint32_t EGG_Decomp_decodeSZS_80218c2c(uint32_t src, uint32_t dst)
             srcIdx += 2;
 
             const uint32_t rep = (high << 8) | low;
-            uint32_t copyIdx = dstIdx - (rep & 0xFFF) - 1;
+            // Without this check dstIdx - distance underflows and the
+            // copy leaks guest memory from before the destination buffer.
+            const uint32_t distance = (rep & 0xFFF) + 1;
+            if (distance > dstIdx) {
+                RT_LOG(RT_TAG_HLE) << "decodeSZS: malformed stream from 0x" << std::hex << src
+                                   << std::dec << ", back-reference before output" << std::endl;
+                ShowRuntimeFatalPopup("corrupt compressed file",
+                                      "The game stopped decoding a malformed Yaz0 file.");
+                std::abort();
+            }
+            uint32_t copyIdx = dstIdx - distance;
             uint32_t count = rep >> 12;
             count = count != 0
                         ? count + 2
@@ -43,9 +53,11 @@ extern "C" uint32_t EGG_Decomp_decodeSZS_80218c2c(uint32_t src, uint32_t dst)
             for (uint32_t i = 0; i < count; ++i) {
                 if (dstIdx >= expandSize) {
                     RT_LOG(RT_TAG_HLE) << "decodeSZS: malformed stream from 0x" << std::hex << src
-                                       << std::dec << ", stopped after " << dstIdx << " of "
-                                       << expandSize << " bytes" << std::endl;
-                    return expandSize;
+                                       << std::dec << ", output overran " << expandSize << " bytes"
+                                       << std::endl;
+                    ShowRuntimeFatalPopup("corrupt compressed file",
+                                          "The game stopped decoding a malformed Yaz0 file.");
+                    std::abort();
                 }
                 MemoryInline::FlatWrite8(dst + dstIdx++, MemoryInline::FlatRead8(dst + copyIdx++));
             }
