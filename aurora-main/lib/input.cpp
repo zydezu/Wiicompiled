@@ -316,6 +316,25 @@ void apply_port_preferences() noexcept {
     }
   }
 }
+
+// SDL only hands out a player index when the device already had a gamepad mapping
+// at connect time, so anything mapped later (the setup wizard) stays at -1.
+void ensure_player_index(GameController& controller) noexcept {
+  if (SDL_GetGamepadPlayerIndex(controller.m_controller) >= 0) {
+    return;
+  }
+  for (int32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+    const bool taken = std::any_of(g_GameControllers.begin(), g_GameControllers.end(), [&](const auto& entry) {
+      return entry.second.m_controller != controller.m_controller &&
+             SDL_GetGamepadPlayerIndex(entry.second.m_controller) == port;
+    });
+    if (!taken) {
+      SDL_SetGamepadPlayerIndex(controller.m_controller, port);
+      controller.m_playerIndex = port;
+      return;
+    }
+  }
+}
 } // namespace
 
 GameController* get_controller_for_player(uint32_t player) noexcept {
@@ -364,11 +383,25 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
     controller.m_hasRgbLed = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
     SDL_JoystickID instance = SDL_GetJoystickID(SDL_GetGamepadJoystick(ctrl));
     g_GameControllers[instance] = controller;
+    ensure_player_index(g_GameControllers[instance]);
     apply_port_preferences();
     return instance;
   }
 
   return -1;
+}
+
+bool refresh_controller(SDL_JoystickID instance) noexcept {
+  const auto it = g_GameControllers.find(instance);
+  if (it == g_GameControllers.end()) {
+    return false;
+  }
+  // The SDL mapping changed underneath us; drop the cached PAD bindings so they
+  // are rebuilt from the new one.
+  it->second.m_mappingLoaded = false;
+  ensure_player_index(it->second);
+  apply_port_preferences();
+  return true;
 }
 
 void remove_controller(Uint32 instance) noexcept {
