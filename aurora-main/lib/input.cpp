@@ -255,6 +255,18 @@ IdentityMatch identity_match(const ControllerIdentity& saved, const ControllerId
              : IdentityMatch::None;
 }
 
+void assign_player_index(GameController& controller, int32_t port) {
+  SDL_SetGamepadPlayerIndex(controller.m_controller, port);
+  controller.m_playerIndex = port;
+}
+
+// SDL forgets the index for devices mapped after connect, so player_index() falls
+// back to the cached copy; both have to move together or a port looks doubly taken.
+int32_t effective_player_index(const GameController& controller) {
+  const int32_t player = SDL_GetGamepadPlayerIndex(controller.m_controller);
+  return player >= 0 ? player : controller.m_playerIndex;
+}
+
 bool is_instance_claimed(const std::array<Uint32, PAD_MAX_CONTROLLERS>& claimedControllers, size_t claimedCount,
                          Uint32 instance) {
   return std::find(claimedControllers.begin(), claimedControllers.begin() + claimedCount, instance) !=
@@ -269,10 +281,10 @@ void apply_port_preferences() noexcept {
   }
 
   for (auto& [instance, controller] : g_GameControllers) {
-    const int32_t player = SDL_GetGamepadPlayerIndex(controller.m_controller);
+    const int32_t player = effective_player_index(controller);
     if (player >= 0 && player < PAD_MAX_CONTROLLERS && g_portPreferences[player].state != PortPreferenceState::Unset) {
       // Keep SDL's default player assignment from taking explicitly configured ports
-      SDL_SetGamepadPlayerIndex(controller.m_controller, -1);
+      assign_player_index(controller, -1);
     }
   }
 
@@ -293,7 +305,7 @@ void apply_port_preferences() noexcept {
 
       switch (identity_match(preference.identity, controller_identity(controller))) {
       case IdentityMatch::Exact:
-        SDL_SetGamepadPlayerIndex(controller.m_controller, static_cast<int32_t>(port));
+        assign_player_index(controller, static_cast<int32_t>(port));
         claimedControllers[claimedCount++] = instance;
         fallbackController = nullptr;
         break;
@@ -311,7 +323,7 @@ void apply_port_preferences() noexcept {
     }
 
     if (fallbackController != nullptr) {
-      SDL_SetGamepadPlayerIndex(fallbackController->m_controller, static_cast<int32_t>(port));
+      assign_player_index(*fallbackController, static_cast<int32_t>(port));
       claimedControllers[claimedCount++] = fallbackInstance;
     }
   }
@@ -320,19 +332,34 @@ void apply_port_preferences() noexcept {
 // SDL only hands out a player index when the device already had a gamepad mapping
 // at connect time, so anything mapped later (the setup wizard) stays at -1.
 void ensure_player_index(GameController& controller) noexcept {
-  if (SDL_GetGamepadPlayerIndex(controller.m_controller) >= 0) {
+  const int32_t player = SDL_GetGamepadPlayerIndex(controller.m_controller);
+  if (player >= 0) {
+    controller.m_playerIndex = player;
     return;
   }
-  for (int32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
-    const bool taken = std::any_of(g_GameControllers.begin(), g_GameControllers.end(), [&](const auto& entry) {
-      return entry.second.m_controller != controller.m_controller &&
-             SDL_GetGamepadPlayerIndex(entry.second.m_controller) == port;
-    });
-    if (!taken) {
-      SDL_SetGamepadPlayerIndex(controller.m_controller, port);
-      controller.m_playerIndex = port;
-      return;
+  if (controller.m_playerIndex >= 0) {
+    return;
+  }
+  ensure_port_preferences_loaded();
+  const auto claim = [&](bool skipConfiguredPorts) {
+    for (int32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+      if (skipConfiguredPorts && g_portPreferences[port].state != PortPreferenceState::Unset) {
+        continue;
+      }
+      const bool taken = std::any_of(g_GameControllers.begin(), g_GameControllers.end(), [&](const auto& entry) {
+        return entry.second.m_controller != controller.m_controller && effective_player_index(entry.second) == port;
+      });
+      if (!taken) {
+        assign_player_index(controller, port);
+        return true;
+      }
     }
+    return false;
+  };
+  // Explicitly configured ports are only used as a last resort so a hot-plugged
+  // controller cannot steal the port its preferred device will claim.
+  if (!claim(true)) {
+    claim(false);
   }
 }
 } // namespace

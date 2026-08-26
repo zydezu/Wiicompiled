@@ -150,7 +150,7 @@ std::string BuildMappingString() {
     return mapping;
 }
 
-void PersistMapping(const std::string& guid, const std::string& mapping) {
+bool PersistMapping(const std::string& guid, const std::string& mapping) {
     const std::filesystem::path path = MappingDbPath();
     std::vector<std::string> lines;
     {
@@ -166,9 +166,14 @@ void PersistMapping(const std::string& guid, const std::string& mapping) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        return false;
+    }
     for (const auto& line : lines) {
         out << line << '\n';
     }
+    out.close();
+    return static_cast<bool>(out);
 }
 
 void FinishWizard() {
@@ -180,7 +185,11 @@ void FinishWizard() {
                               << std::endl;
         return;
     }
-    PersistMapping(guid, mapping);
+    if (!PersistMapping(guid, mapping)) {
+        g_wizard.status = "Failed to save mapping to " + MappingDbPath().string();
+        RT_LOG(RT_TAG_CONFIG) << "controller wizard: " << g_wizard.status << std::endl;
+        return;
+    }
     RT_LOG(RT_TAG_CONFIG) << "controller wizard: applied mapping " << mapping << std::endl;
     StopWizard();
 }
