@@ -639,11 +639,7 @@ inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
 inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
     if (target == 0) {
-        // A call through address 0 is a virtual dispatch through a null "this",
-        // not a missing translator target, so skip it instead of crashing.
-        RT_LOG(RT_TAG_RUNTIME) << "InvokeIndirectCpu: skipped a virtual call through a null "
-            "object pointer (caller LR=0x" << std::hex << cpu->lr << std::dec << ")" << std::endl;
-        return;
+        ReportMissingCpuTarget(target, cpu);
     }
     ApplyRuntimeCallOptions(target, cpu);
     if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
