@@ -275,7 +275,13 @@ public static class ContinuationPlanner
         AddSigned
     }
 
-    public static IEnumerable<int> DiscoverLrRelativeIndirectJumpOffsets(IReadOnlyList<PpcInstruction> instructions)
+    // Dropped states make a negative result inconclusive.
+    private const int MaxStatesPerInstruction = 512;
+
+    public static IEnumerable<int> DiscoverLrRelativeIndirectJumpOffsets(
+        IReadOnlyList<PpcInstruction> instructions,
+        Action? onStateCapExceeded = null,
+        Action? onUnresolvedExit = null)
     {
         if (instructions.Count == 0)
         {
@@ -296,7 +302,6 @@ public static class ContinuationPlanner
 
         var seenOffsets = new HashSet<int>();
         var worklist = new Queue<(int Index, PathState State)>();
-        const int MaxStatesPerInstruction = 16;
 
         void Enqueue(int targetIndex, PathState stateToEnqueue)
         {
@@ -325,6 +330,7 @@ public static class ContinuationPlanner
 
             if (visited[idx].Count > MaxStatesPerInstruction)
             {
+                onStateCapExceeded?.Invoke();
                 continue;
             }
 
@@ -484,6 +490,9 @@ public static class ContinuationPlanner
                     yield return state.CtrOffset.Value;
                 }
 
+                if (!state.CtrOffset.HasValue && instruction.BranchTargets.Count == 0)
+                    onUnresolvedExit?.Invoke();
+
                 nextState = nextState.WithCtrOffset(null);
                 if (instruction.BranchTargets.Count == 0)
                 {
@@ -495,6 +504,8 @@ public static class ContinuationPlanner
                 (mnemonic.StartsWith("b", StringComparison.Ordinal) && mnemonic.EndsWith("lr", StringComparison.Ordinal)));
             if (isReturn)
             {
+                if (!state.LrReturnOffset.HasValue)
+                    onUnresolvedExit?.Invoke();
                 if (state.LrReturnOffset.HasValue && state.LrReturnOffset.Value != 0 && seenOffsets.Add(state.LrReturnOffset.Value))
                 {
                     yield return state.LrReturnOffset.Value;
@@ -524,7 +535,7 @@ public static class ContinuationPlanner
                     Enqueue(fallthrough.Value, nextState);
                 }
 
-                if (!isReturn)
+                if (!isReturn && !instruction.IsCall)
                 {
                     foreach (var target in instruction.BranchTargets)
                     {

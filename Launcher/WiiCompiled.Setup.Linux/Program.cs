@@ -143,6 +143,15 @@ internal static class Program
             retroWfcOfflineDir = cacheDir;
         }
 
+        var sysroot = flags.GetValueOrDefault("sysroot");
+        // --sysroot explicitly provided (even as bare flag at end of argv, which ParseArgs
+        // stores as null) must carry a path; omitting --sysroot entirely is fine (local-build.sh
+        // adds -UCMAKE_SYSROOT to clear any stale cached value from a prior configure).
+        if (flags.ContainsKey("sysroot") && string.IsNullOrWhiteSpace(sysroot))
+        {
+            throw new ArgumentException("--sysroot requires a non-empty directory path.");
+        }
+
         await BuildRunner.RunAsync(
             workspace, profile, installDir, baseInstallDir,
             retroDir,
@@ -156,6 +165,7 @@ internal static class Program
             flags.GetValueOrDefault("cmake"),
             flags.GetValueOrDefault("ninja"),
             flags.GetValueOrDefault("native-prebuilt-dir"),
+            sysroot,
             reporter, token);
 
         reporter.Progress(InstallStages.Shortcuts, "Creating shortcuts", 98);
@@ -324,7 +334,7 @@ internal static class Program
                   {--download-retro-wfc-payload | --skip-retro-wfc-payload}]
                   [--force-clean-build] [--translator-bin PATH] [--disc-tool-bin PATH]
                   [--cc PATH] [--cxx PATH] [--fuse-ld NAME_OR_PATH] [--cmake PATH] [--ninja PATH]
-                  [--native-prebuilt-dir DIR] [--progress-json] [--workspace DIR]
+                  [--native-prebuilt-dir DIR] [--sysroot PATH] [--progress-json] [--workspace DIR]
           uninstall
           launch-base
           launch-retro

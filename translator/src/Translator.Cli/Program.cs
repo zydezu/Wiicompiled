@@ -2282,9 +2282,37 @@ int EmitModCpp(
                 .Where(h => h.TargetAddress.HasValue && RetroWfcHookSetsLinkRegister(h))
                 .Select(h => (h.TargetAddress!.Value, h.ContinuationAddress)));
     }
+    var hookLrAnalysis = new Dictionary<uint, LrContinuationAnalysis>();
+    var hookDiscoveryCache = new Dictionary<uint, IReadOnlyList<PpcInstruction>>();
+    IReadOnlyList<PpcInstruction> DiscoverHookBody(uint target)
+    {
+        if (!hookDiscoveryCache.TryGetValue(target, out var instructions))
+        {
+            instructions = modTranslator.Discover(target,
+                new TranslationOptions(KnownFunctionEntryPoints: knownFunctionEntryPoints)).Instructions;
+            hookDiscoveryCache.Add(target, instructions);
+        }
+        return instructions;
+    }
+
+    LrContinuationAnalysis AnalyzeHook(uint target)
+    {
+        if (!hookLrAnalysis.TryGetValue(target, out var analysis))
+        {
+            analysis = LrContinuationAnalysis.Analyze(target, DiscoverHookBody);
+            hookLrAnalysis.Add(target, analysis);
+        }
+        return analysis;
+    }
+
     foreach (var patch in patchPlan.ExecutablePatches.Where(p => p.CommandId == KamekCommandId.BranchLink && p.Arguments.Count > 0))
     {
         var target = KamekAddress.Resolve(patch.Arguments[0], patchPlan.ModuleGuestBase);
+        if (!AnalyzeHook(target).MaySkipReturn)
+        {
+            continue;
+        }
+
         hookLrBases.Add((target, checked(patch.CommandAddress + 4u)));
     }
 
@@ -2387,49 +2415,41 @@ int EmitModCpp(
         }
     }
 
-    void RecordDiscoveredLrRelativeBaseContinuations(
-        FunctionTranslationResult result,
-        IReadOnlyList<uint> lrBases,
-        string reason)
+    void RecordHookContinuations(uint hookTarget, IReadOnlyList<uint> lrBases)
     {
-        if (lrBases.Count == 0)
+        var analysis = AnalyzeHook(hookTarget);
+        foreach (var lrBase in lrBases)
         {
-            return;
-        }
-
-        foreach (var offset in DiscoverLrRelativeIndirectJumpOffsets(result).Distinct())
-        {
-            foreach (var lrBase in lrBases)
+            var targets = analysis.Offsets.Select(offset => unchecked(lrBase + (uint)offset));
+            if (analysis.WasTruncated && baseFunctions.FindContaining(lrBase - 4u) is { } caller)
             {
-                var target = unchecked(lrBase + (uint)offset);
+                // Unknown offsets can resume at any aligned instruction in this caller.
+                targets = targets.Concat(Enumerable.Range(0, checked((int)((caller.End - caller.Start) / 4)))
+                    .Select(index => caller.Start + (uint)index * 4u));
+            }
+            foreach (var target in targets.Distinct())
+            {
                 var section = baseManifest.Sections.FirstOrDefault(s => target >= s.GuestStart && target < s.GuestEnd);
-                if (section is null || !section.Executable)
-                {
+                if (section is null || !section.Executable || (target & 3u) != 0)
                     continue;
-                }
-
                 var containing = baseFunctions.FindContaining(target);
-                if (containing is null || containing.Start == target)
-                {
+                if (containing is null || containing.Start == target || !queuedContinuationAddresses.Add(target))
                     continue;
-                }
-
-                if (!queuedContinuationAddresses.Add(target))
-                {
-                    continue;
-                }
 
                 discoveredContinuationQueue.Enqueue(new ContinuationEntry(
                     target,
                     containing.Start,
                     containing.End,
                     section.Name,
-                    result.EntryPoint,
+                    hookTarget,
                     KamekCommandId.Branch,
-                    $"{reason}; LR-relative jump offset {offset:+#;-#;0}"));
+                    $"LR-relative hook target 0x{hookTarget:X8}"));
             }
         }
     }
+
+    foreach (var (target, lrBases) in linkedHookLrBasesByTarget)
+        RecordHookContinuations(target, lrBases);
 
     ModTranslationWork CreateContinuationWork(ContinuationEntry continuation)
     {
@@ -2596,16 +2616,7 @@ int EmitModCpp(
         }
 
         CommitWave(attempts, (result, work) =>
-        {
-            RecordDiscoveredBaseContinuations(result, $"base continuation discovered from module 0x{work.Address:X8}");
-            if (linkedHookLrBasesByTarget.TryGetValue(work.Address, out var lrBases))
-            {
-                RecordDiscoveredLrRelativeBaseContinuations(
-                    result,
-                    lrBases,
-                    $"base continuation discovered from LR-relative hook target 0x{work.Address:X8}");
-            }
-        });
+            RecordDiscoveredBaseContinuations(result, $"base continuation discovered from module 0x{work.Address:X8}"));
     }
 
     DrainDiscoveredContinuations();
@@ -2762,9 +2773,6 @@ IEnumerable<uint> DirectModuleTargets(FunctionTranslationResult result, uint mod
         }
     }
 }
-
-IEnumerable<int> DiscoverLrRelativeIndirectJumpOffsets(FunctionTranslationResult result) =>
-    ContinuationPlanner.DiscoverLrRelativeIndirectJumpOffsets(result.Instructions);
 
 static bool RetroWfcHookSetsLinkRegister(RetroWfcExecutableHookPlan hook) =>
     hook.TypeName is "call" or "branchCtrLink" ||

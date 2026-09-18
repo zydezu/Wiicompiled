@@ -1,5 +1,6 @@
 #include "settings_overlay.h"
 #include "audio_backend.h"
+#include "aurora_events.h"
 #include "controller_button_names.h"
 #include "controller_mapping_wizard.h"
 #include "input_bindings.h"
@@ -16,6 +17,7 @@
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_scancode.h>
+#include <SDL3/SDL_timer.h>
 
 #include <array>
 #include <algorithm>
@@ -71,6 +73,7 @@ const char* GraphicsApiDisplayName() {
 }
 
 bool g_topBarVisible = false;
+bool g_exitPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
@@ -81,6 +84,7 @@ int g_soundEffectsVolumePercent =
 int g_uiVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::UiVolume(1.0f) * 100.0f));
 int g_voicesVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::VoicesVolume(1.0f) * 100.0f));
 bool g_audioMuted = RuntimeConfigFile::AudioMuted(false);
+int32_t g_muteHotkey = RuntimeConfigFile::MuteHotkey(SDL_SCANCODE_BACKSLASH);
 bool g_audioMixWorker = RuntimeConfigFile::AudioMixWorkerEnabled(true);
 bool g_attenuateMusicWhenMediaPlays = RuntimeConfigFile::AttenuateMusicWhenMediaPlays(false);
 int g_frameInterpolationMode = [] {
@@ -430,7 +434,7 @@ const char* KeyBindingName(int scancode) {
     }
 }
 
-enum class RebindKind { KeyboardButton, KeyboardAxis, Controller };
+enum class RebindKind { KeyboardButton, KeyboardAxis, Controller, MuteHotkey };
 struct RebindState {
     bool active = false;
     bool openPopup = false;
@@ -496,6 +500,11 @@ void CompleteRebind(uint32_t value) {
         if (alternateValue != PAD_NATIVE_BUTTON_INVALID) config += ',' + NativeBindingConfig(alternateValue);
         for (size_t i = 0; i < kControllerButtons.size(); ++i)
             if (kControllerButtons[i].padButton == capture.target) RuntimeConfigFile::SetControllerButton(i, config);
+    } else if (capture.kind == RebindKind::MuteHotkey) {
+        g_muteHotkey = static_cast<int32_t>(value);
+        RuntimeConfigFile::SetMuteHotkey(g_muteHotkey);
+        g_rebind.active = false;
+        return;
     } else if (capture.kind == RebindKind::KeyboardButton) {
         PADSetKeyButtonBinding(capture.port, {static_cast<int32_t>(value), capture.target});
     } else {
@@ -518,7 +527,9 @@ void DrawRebindPrompt() {
         ImGui::Text("Rebind: %s", g_rebind.label.c_str());
         ImGui::TextUnformatted(g_rebind.kind == RebindKind::Controller
             ? "Press a controller button, pull a trigger, or move a stick."
-            : "Press a keyboard key or click a mouse button.");
+            : g_rebind.kind == RebindKind::MuteHotkey
+                ? "Press a keyboard key."
+                : "Press a keyboard key or click a mouse button.");
         ImGui::TextUnformatted("Release any held input first. Backspace or Delete clears the mapping.");
         ImGui::TextUnformatted("Escape can be bound. F10 is reserved for settings.");
         const float remaining = std::chrono::duration<float>(g_rebind.deadline - Clock::now()).count();
@@ -540,7 +551,8 @@ void DrawRebindPrompt() {
             }
             const uint32_t mouse = SDL_GetMouseState(nullptr, nullptr);
             for (int i = 1; i <= 5 && g_rebind.active; ++i)
-                if (!overControl && (mouse & ~g_rebind.mouse & (1u << (i - 1))) != 0) CompleteRebind(static_cast<uint32_t>(-i - 1));
+                if (!overControl && g_rebind.kind != RebindKind::MuteHotkey &&
+                    (mouse & ~g_rebind.mouse & (1u << (i - 1))) != 0) CompleteRebind(static_cast<uint32_t>(-i - 1));
             g_rebind.mouse = mouse;
         } else if (g_rebind.active && SDL_GetKeyboardFocus() != nullptr && g_rebind.kind == RebindKind::Controller) {
             auto* pad = SDL_GetGamepadFromID(g_rebind.instance);
@@ -563,10 +575,11 @@ void DrawRebindPrompt() {
     ImGui::EndPopup();
 }
 
-void DrawKeyBinding(const char* label, int scancode, RebindKind kind, uint16_t target) {
+void DrawKeyBinding(const char* label, int scancode, RebindKind kind, uint16_t target,
+                    float width = 220.0f) {
     const std::string caption = std::string(KeyBindingName(scancode)) + "##binding";
-    if (ImGui::Button(caption.c_str(), ImVec2(220.0f, 0.0f))) BeginRebind(kind, target, label);
-    ImGui::SameLine();
+    if (ImGui::Button(caption.c_str(), ImVec2(width, 0.0f))) BeginRebind(kind, target, label);
+    ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::TextUnformatted(label);
 
 }
@@ -953,10 +966,14 @@ void DrawAudioSettings() {
         MusicAttenuation::SetVoicesVolume(volume);
         RuntimeConfigFile::SetVoicesVolume(volume);
     }
+    const float labelColumn = ImGui::GetCursorPosX() + ImGui::CalcItemWidth();
     if (ImGui::Checkbox("Mute", &g_audioMuted)) {
         AudioBackend::Instance().SetMuted(g_audioMuted);
         RuntimeConfigFile::SetAudioMuted(g_audioMuted);
     }
+    ImGui::SameLine();
+    DrawKeyBinding("Mute shortcut", g_muteHotkey, RebindKind::MuteHotkey, 0,
+                   std::max(60.0f, labelColumn - ImGui::GetCursorPosX()));
     ImGui::Separator();
     if (ImGui::Checkbox("Mix audio on a worker thread", &g_audioMixWorker)) {
         // Applies immediately: SetMixWorkerEnabled joins any in-flight mix
@@ -1188,6 +1205,18 @@ void DrawStartupScreen() {
     ImGui::PopStyleColor();
 }
 
+void DrawExitPrompt() {
+    constexpr const char* kTitle = "Exit";
+    if (g_exitPromptOpen && !ImGui::IsPopupOpen(kTitle)) ImGui::OpenPopup(kTitle);
+    if (!ImGui::BeginPopupModal(kTitle, &g_exitPromptOpen, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    ImGui::TextUnformatted("Quit the game?");
+    if (ImGui::Button("Exit", ImVec2(120.0f, 0.0f))) ExitForAuroraWindowClose();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) g_exitPromptOpen = false;
+    if (!g_exitPromptOpen) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 void DrawTopBar() {
     if (!g_topBarVisible) {
         return;
@@ -1253,13 +1282,20 @@ void DrawTopBar() {
     const std::string audioMenuLabel = audioLabel + "###AudioSettingsMenu";
     if (ImGui::BeginMenu(audioMenuLabel.c_str())) {
         DrawAudioSettings();
+        DrawRebindPrompt();
         ImGui::EndMenu();
     }
 
-    const float hideWidth = ImGui::CalcTextSize("Hide (F10)").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - hideWidth - 8.0f));
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float hideWidth = ImGui::CalcTextSize("Hide (F10)").x + style.FramePadding.x * 2.0f;
+    const float exitWidth = ImGui::CalcTextSize("X").x + style.FramePadding.x * 2.0f;
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                  ImGui::GetWindowWidth() - hideWidth - exitWidth - style.ItemSpacing.x - 8.0f));
     if (ImGui::MenuItem("Hide (F10)")) {
         SetTopBarVisible(false);
+    }
+    if (ImGui::MenuItem("X")) {
+        g_exitPromptOpen = true;
     }
     ImGui::EndMainMenuBar();
 }
@@ -1289,9 +1325,12 @@ void UpdateCursorAutoHide() {
         return;
     }
     g_cursorHidden = shouldHide;
+    // ImGui_ImplSDL3_NewFrame calls SDL_ShowCursor every frame unless this flag is set.
     if (shouldHide) {
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
         SDL_HideCursor();
     } else {
+        ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
         SDL_ShowCursor();
     }
 }
@@ -1355,10 +1394,40 @@ void HandleEvents(const AuroraEvent* events) noexcept {
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_F10)) {
             SetTopBarVisible(!g_topBarVisible);
         }
+        if (!g_rebind.active && g_muteHotkey != PAD_KEY_INVALID &&
+            IsToggleKey(ev->sdl, static_cast<SDL_Scancode>(g_muteHotkey))) {
+            g_audioMuted = !g_audioMuted;
+            AudioBackend::Instance().SetMuted(g_audioMuted);
+            RuntimeConfigFile::SetAudioMuted(g_audioMuted);
+        }
+        if (!g_rebind.active && !g_topBarVisible && IsToggleKey(ev->sdl, SDL_SCANCODE_ESCAPE)) {
+            g_exitPromptOpen = true;
+        }
         if (IsMouseActivity(ev->sdl)) {
             g_lastMouseActivity = Clock::now();
         }
     }
+}
+
+void ReleaseControllers() noexcept {
+    // Aurora drives the LED white on first PADRead and never clears it, and the
+    // exit paths terminate the process outright, so do it here.
+    bool queued = false;
+    for (uint32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+        const s32 index = PADGetIndexForPort(port);
+        if (index < 0) continue;
+        if (SDL_Gamepad* pad = PADGetSDLGamepadForIndex(static_cast<u32>(index))) {
+            SDL_SetGamepadLED(pad, 0, 0, 0);
+            queued = true;
+        }
+    }
+    constexpr std::array<uint32_t, PAD_MAX_CONTROLLERS> stopAll{
+        PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD};
+    PADControlAllMotors(stopAll.data());
+    // SDL hands LED and rumble reports to its own HIDAPI sender thread rather
+    // than writing them here, so without this the process dies before the
+    // controller ever receives them.
+    if (queued) SDL_Delay(120);
 }
 
 void Draw() noexcept {
@@ -1378,6 +1447,7 @@ void Draw() noexcept {
     }
     DrawFpsOverlay();
     DrawTopBar();
+    DrawExitPrompt();
     controller_mapping_wizard::Draw();
     // The wizard captures raw presses; keep them out of the game.
     const bool inputBlocked = controller_mapping_wizard::IsActive() || g_rebind.active;
