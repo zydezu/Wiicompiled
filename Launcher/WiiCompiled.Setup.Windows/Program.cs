@@ -1,5 +1,6 @@
 ﻿namespace WiiCompiled.Setup.Windows;
 
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 internal static class Program
@@ -121,7 +122,9 @@ internal static class PlatformChecks
 internal static class ProductInfo
 {
     public const string Name = "WiiCompiled";
-    public const string Version = "0.2.32";
+    public static readonly string Version =
+        typeof(ProductInfo).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!
+            .InformationalVersion;
 
     /// <summary>
     /// The setup executable is copied into the installation under this name. It is the launcher and

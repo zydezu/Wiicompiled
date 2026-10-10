@@ -15,6 +15,29 @@ public class PpcLifterAdditionalCoverageTests
         => PpcInstruction.Synthetic(0x80000000, raw, mnemonic, operands);
 
     [Fact]
+    public void LinkedConditionalBranchSetsLrBeforeEitherPath()
+    {
+        var branch = PpcDecoder.Decode(0x80004394, 0x41800029);
+        var ir = Assert.Single(new PpcLifter().Lift(new[] { branch })).Ir;
+
+        Assert.Equal("bltl", branch.Mnemonic);
+        Assert.Equal(2, ir.Count);
+
+        var lrAssign = Assert.IsType<IrAssign>(ir[0]);
+        Assert.Equal("lr", lrAssign.Destination);
+        Assert.Equal(unchecked((int)0x80004398u), lrAssign.Value.Constant);
+        Assert.Equal(unchecked((int)branch.EndAddress), lrAssign.Value.Constant);
+
+        var decision = Assert.IsType<IrBranch>(ir[1]);
+        Assert.Equal("raw", decision.Condition);
+        Assert.Equal("link_branch_80004398_800043BC", decision.TrueLabel);
+        Assert.Equal("0x80004398", decision.FalseLabel);
+
+        Assert.Equal($"link_branch_{branch.EndAddress:X8}_{branch.BranchTargets.First():X8}", decision.TrueLabel);
+        Assert.Equal($"0x{branch.EndAddress:X8}", decision.FalseLabel);
+    }
+
+    [Fact]
     public void LiftsAdditionalNonDotArithmeticAndLogicalForms()
     {
         var lifter = new PpcLifter();

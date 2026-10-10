@@ -833,8 +833,8 @@ extern "C" double PPC_PsqL(uint32_t addr, uint32_t w, uint32_t i)
     }
 
     const uint32_t gqr = cpu->gqr[i & 7];
-    return w == 0 ? PPC_PsqLStateFallback<0u, 0u, false>(gqr, addr)
-                  : PPC_PsqLStateFallback<1u, 0u, false>(gqr, addr);
+    return w == 0 ? PPC_PsqLStateFallback<0u, false>(gqr, addr)
+                  : PPC_PsqLStateFallback<1u, false>(gqr, addr);
 }
 
 extern "C" void PPC_PsqSt(uint32_t addr, double value, uint32_t w, uint32_t i)
@@ -848,11 +848,11 @@ extern "C" void PPC_PsqSt(uint32_t addr, double value, uint32_t w, uint32_t i)
     const uint32_t gqr = cpu->gqr[i & 7];
     if (w == 0)
     {
-        PPC_PsqStStateFallback<0u, 0u, false>(gqr, addr, value);
+        PPC_PsqStStateFallback<0u, false>(gqr, addr, value);
     }
     else
     {
-        PPC_PsqStStateFallback<1u, 0u, false>(gqr, addr, value);
+        PPC_PsqStStateFallback<1u, false>(gqr, addr, value);
     }
 }
 

@@ -1942,6 +1942,7 @@ public sealed partial class PpcLifter
                     new IrCall(string.Empty, TargetLabel(ins, validAddresses, preferFallthrough: false), blArgs) 
                 };
 
+            case "bltl":
             case "bcl":
                 {
                     var rawInstr = ReadRawInstruction(ins);
@@ -1955,6 +1956,7 @@ public sealed partial class PpcLifter
                     {
                         instructions.Add(new IrBinary("ctr", IrValue.Register("ctr"), IrValue.Imm(-1), "add"));
                     }
+                    instructions.Add(new IrAssign("lr", IrValue.Imm((int)ins.EndAddress)));
                     instructions.Add(new IrBranch("raw", linkedTarget, fallthrough, BuildBoConditionExpression(bo, bi, allowCtr: true)));
                     return instructions;
                 }

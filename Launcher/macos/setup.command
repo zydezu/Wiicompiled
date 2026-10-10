@@ -5,10 +5,7 @@ set -euo pipefail
 
 resources=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace_source="$resources/workspace"
-nodtool="$resources/tools/nodtool"
-translator="$resources/tools/Translator.Cli"
 cmake_bin="$resources/tools/cmake/bin/cmake"
-ninja_bin="$resources/tools/ninja"
 support_root="$HOME/Library/Application Support/WiiCompiled"
 workspace="$support_root/BuildWorkspace"
 products="$support_root/Products"
@@ -36,6 +33,13 @@ while (($#)); do
 done
 [[ "$install_location" == user || "$install_location" == applications ]] || fail '--install-location must be user or applications'
 
+host_arch=$(uname -m)
+case "$host_arch" in arm64|x86_64) ;; *) fail "unsupported macOS architecture: $host_arch" ;; esac
+host_tools="$resources/tools/$host_arch"
+nodtool="$host_tools/nodtool"
+translator="$host_tools/Translator.Cli"
+ninja_bin="$host_tools/ninja"
+
 if [[ -z "$game" ]]; then
     game=$(/usr/bin/osascript <<'APPLESCRIPT'
 set selectedFile to choose file with prompt "Choose your clean Mario Kart Wii PAL (RMCP01) disc image"
@@ -60,12 +64,37 @@ if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
     /usr/bin/xcode-select --install || true
     exit 1
 fi
+for tool in "$nodtool" "$translator" "$cmake_bin" "$ninja_bin"; do
+    /usr/bin/lipo "$tool" -verify_arch "$host_arch" >/dev/null 2>&1 || \
+        fail "the packaged $(basename "$tool") does not support $host_arch"
+done
 
 mkdir -p "$support_root" "$products"
-if [[ ! -d "$workspace/.git" && ! -f "$workspace/projects/mkwii/recomp.yml" ]]; then
+source_bundle_version="$workspace_source/.bundle-version"
+workspace_bundle_version="$workspace/.bundle-version"
+needs_workspace_refresh=0
+if [[ ! -f "$workspace/projects/mkwii/recomp.yml" ]]; then
+    needs_workspace_refresh=1
+elif [[ -f "$source_bundle_version" ]] && [[ ! -f "$workspace_bundle_version" || "$(<"$source_bundle_version")" != "$(<"$workspace_bundle_version")" ]]; then
+    needs_workspace_refresh=1
+fi
+
+if (( needs_workspace_refresh )); then
     printf 'Preparing the local build workspace...\n'
-    rm -rf "$workspace"
-    /usr/bin/ditto "$workspace_source" "$workspace"
+    if [[ ! -d "$workspace" ]]; then
+        /usr/bin/ditto "$workspace_source" "$workspace"
+    else
+        # Refresh only packaged source inputs. Assets and the staged Retro
+        # Rewind package belong to the user and stay in place.
+        for source in aurora-main projects runtime translator Launcher; do
+            rm -rf "$workspace/$source"
+            /usr/bin/ditto "$workspace_source/$source" "$workspace/$source"
+        done
+        /usr/bin/ditto "$source_bundle_version" "$workspace_bundle_version"
+        # A dependency provider can be cached in this directory, so make the
+        # refreshed sources configure from a clean native build tree.
+        rm -rf "$workspace/native-build-macos-arm64" "$workspace/native-build-macos-x86_64"
+    fi
 fi
 
 profile=base
@@ -77,26 +106,40 @@ if [[ -n "$retro_dir" ]]; then
     # verify its pinned signature before publishing it into the local cache.
     retro_wfc_dir="$support_root/RetroWfcPayload"
     retro_wfc_payload="$retro_wfc_dir/binary/payload.RMCPD00.bin"
-    if [[ -f "$retro_wfc_payload" ]] && ! "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
-        printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
-        rm -f "$retro_wfc_payload"
+    cached_payload_valid=0
+    if [[ -f "$retro_wfc_payload" ]]; then
+        if "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
+            cached_payload_valid=1
+        else
+            printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
+            rm -f "$retro_wfc_payload"
+        fi
     fi
-    if [[ ! -f "$retro_wfc_payload" ]]; then
-        printf 'Downloading the Retro-WFC payload needed for online play...\n'
-        mkdir -p "$retro_wfc_dir"
-        payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
-        temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
-        mkdir -p "$(dirname "$temporary_payload")"
-        trap 'rm -rf "$payload_stage"' EXIT
-        /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            --retry 1 --output "$temporary_payload" \
-            'https://rwfc.net/api/wfc/payload?g=RMCPD00' || fail 'could not download the Retro-WFC payload needed for online play'
+
+    # A signed cache may still be an older vulnerable revision, so always attempt to replace it
+    # with the current signed snapshot. A transport failure may fall back to the verified cache;
+    # a downloaded snapshot with an invalid signature remains a hard failure.
+    printf 'Downloading the current Retro-WFC payload needed for online play...\n'
+    mkdir -p "$retro_wfc_dir"
+    payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
+    temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
+    mkdir -p "$(dirname "$temporary_payload")"
+    trap 'rm -rf "$payload_stage"' EXIT
+    if /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+        --retry 1 --output "$temporary_payload" \
+        'https://rwfc.net/api/wfc/payload?g=RMCPD00'; then
         "$translator" validate-retro-wfc-payload --directory "$payload_stage" || \
             fail 'downloaded Retro-WFC payload failed signature validation'
         mkdir -p "$retro_wfc_dir/binary"
         mv "$temporary_payload" "$retro_wfc_payload"
         rmdir "$payload_stage/binary" "$payload_stage"
         trap - EXIT
+    elif (( cached_payload_valid )); then
+        printf 'Could not download the current Retro-WFC payload; using the previously verified cached payload.\n' >&2
+        rm -rf "$payload_stage"
+        trap - EXIT
+    else
+        fail 'could not download the current Retro-WFC payload and no valid cached payload is available'
     fi
     build_args+=(--profile both --base-output-dir "$products" --retro-rewind-package-dir "$retro_dir" --retro-wfc-offline-dir "$retro_wfc_dir")
 fi

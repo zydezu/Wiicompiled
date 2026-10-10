@@ -1,4 +1,4 @@
-﻿# Public WiiCompiled product graph.
+# Public WiiCompiled product graph.
 #
 # The translator owns the translated build graph. Mario Kart's profile-neutral
 # functions are compiled once into mkw_base_shared; only callers whose direct
@@ -28,6 +28,7 @@ list(REMOVE_DUPLICATES SOURCES)
 if(MKW_PLATFORM_MACOS)
     find_library(MKW_IOKIT_FRAMEWORK IOKit REQUIRED)
     find_library(MKW_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    find_library(MKW_COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 endif()
 
 function(mkw_apply_common_compile_options target)
@@ -81,14 +82,25 @@ target_compile_definitions(mkw_runtime_common PRIVATE
     _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
 target_link_libraries(mkw_runtime_common PRIVATE
     aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
-target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp)
+target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
 if(MKW_PLATFORM_WINDOWS)
     target_link_libraries(mkw_runtime_common PRIVATE shell32 windowsapp)
-elseif(MKW_PLATFORM_LINUX)
+elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
     # ${CMAKE_DL_LIBS} for music_attenuation.cpp's dlopen of libdbus-1 (MPRIS
-    # media monitoring). Empty string on glibc >= 2.34 where dl* is in libc.
+    # media monitoring). Empty on platforms where dl* is already in libc/libSystem.
     target_link_libraries(mkw_runtime_common PRIVATE mkw::libco ${CMAKE_DL_LIBS})
 endif()
+
+if(MKW_PLATFORM_MACOS)
+    # CoreAudio framework is required for automatic music muting on macOS.
+    target_link_libraries(mkw_runtime_common PRIVATE "${MKW_COREAUDIO_FRAMEWORK}")
+    if(MKW_PLATFORM_MACOS_X86_64)
+        # libco is used by Intel macOS. Apple Silicon uses the local
+        # x18-safe assembly backend and therefore does not define mkw::libco.
+        target_link_libraries(mkw_runtime_common PRIVATE mkw::libco)
+    endif()
+endif()
+
 if(MKW_CPPWINRT_INCLUDE_DIR)
     if(NOT EXISTS "${MKW_CPPWINRT_INCLUDE_DIR}/winrt/base.h")
         message(FATAL_ERROR
@@ -118,29 +130,23 @@ foreach(source IN LISTS SOURCES)
     endif()
     set_source_files_properties("${source}" PROPERTIES UNITY_GROUP "${runtime_group}")
 endforeach()
-# These translation units implement guest-visible floating-point bit
-# semantics.  Keep them out of the fast-math runtime unity groups and apply
-# the same contraction/rounding policy as translated PPC shards.
-set(MKW_PPC_SEMANTIC_RUNTIME_SOURCES
-    "${MKW_RUNTIME_SOURCE_DIR}/src/ppc_helpers.cpp"
-    "${MKW_RUNTIME_SOURCE_DIR}/src/fpu_helpers.cpp")
-set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
-    SKIP_UNITY_BUILD_INCLUSION ON
-    SKIP_PRECOMPILE_HEADERS ON
-    COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
+# PPC semantic sources are excluded from unity/PCH and configured in CMakeLists.txt.
 set_target_properties(mkw_runtime_common PROPERTIES UNITY_BUILD ON UNITY_BUILD_MODE GROUP)
 target_precompile_headers(mkw_runtime_common PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
 mkw_apply_common_compile_options(mkw_runtime_common)
 
-# Host ISA guard. Windows and Linux x86_64 product targets use x86-64-v3, so
-# this object deliberately keeps the plain baseline ISA and checks the CPU
-# before any AVX2/FMA code can execute. AArch64 has no equivalent optional ISA
-# floor to probe: NEON/FMA are architectural requirements.
+# Host ISA guard deliberately keeps the plain baseline ISA and checks the
+# selected x86 profile before optional instructions can execute. AArch64 has
+# no equivalent optional ISA floor to probe: NEON/FMA are architectural
+# requirements.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     add_library(mkw_cpu_baseline OBJECT "${MKW_CPU_BASELINE_SOURCE}")
     target_compile_features(mkw_cpu_baseline PRIVATE cxx_std_17)
     set_target_properties(mkw_cpu_baseline PROPERTIES UNITY_BUILD OFF)
     target_compile_options(mkw_cpu_baseline PRIVATE -w)
+    if(MKW_X86_CPU_PROFILE STREQUAL "v2")
+        target_compile_definitions(mkw_cpu_baseline PRIVATE MKW_X86_CPU_PROFILE_V2=1)
+    endif()
 endif()
 
 if(NOT MKW_BASE_COMMON_SHARDS)
@@ -199,13 +205,15 @@ function(mkw_configure_product target)
     # include the same fat translated headers; bound them by the same pool.
     mkw_bound_translated_compiles(${target})
     target_link_libraries(${target} PRIVATE
-        mkw_platform mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp)
+        mkw_platform mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
 
     target_link_libraries(${target} PRIVATE
         aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
     if(MKW_PLATFORM_MACOS)
         target_link_libraries(${target} PRIVATE
-            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}")
+            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}")
+        target_link_options(${target} PRIVATE
+            "LINKER:-U,_OBJC_CLASS_$_MTLLogStateDescriptor")
     endif()
     if(EXISTS "${MKW_AURORA_DIR}/cmake/AuroraCopyRuntimeDLLs.cmake")
         include("${MKW_AURORA_DIR}/cmake/AuroraCopyRuntimeDLLs.cmake")
@@ -226,7 +234,7 @@ function(mkw_configure_product target)
             dbghelp user32 winmm ws2_32 iphlpapi secur32 crypt32 windowsapp)
 
         set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
-    elseif(MKW_PLATFORM_LINUX)
+    elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
         # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
         # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
         # target_link_libraries (object libraries don't carry usage requirements to a consumer
@@ -298,6 +306,21 @@ function(mkw_configure_product target)
     add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${MKW_INITIAL_PIPELINE_CACHE}"
         "$<TARGET_FILE_DIR:${target}>/initial_pipeline_cache.db")
+
+    # Non-Windows TLS (runtime/src/hle/net/network_ssl.cpp's mbed TLS path) needs a trusted root
+    # CA bundle to verify server certificates against - Windows gets this for free from the OS via
+    # Schannel, mbed TLS does not ship one itself. Not SHA256-pinned like the DSP ROM above: unlike
+    # a fixed hardware ROM, this bundle is expected to be refreshed periodically as CAs rotate.
+    # Windows gets its trust store from Schannel, so only the platforms that actually build the
+    # mbed TLS path need the bundle beside the executable.
+    if(NOT MKW_PLATFORM_WINDOWS)
+        set(MKW_CA_CERTIFICATE_BUNDLE "${MKW_RUNTIME_SOURCE_DIR}/assets/certs/cacert.pem")
+        if(NOT EXISTS "${MKW_CA_CERTIFICATE_BUNDLE}")
+            message(FATAL_ERROR "Missing TLS root CA bundle: ${MKW_CA_CERTIFICATE_BUNDLE}")
+        endif()
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MKW_CA_CERTIFICATE_BUNDLE}" "$<TARGET_FILE_DIR:${target}>/cacert.pem")
+    endif()
 endfunction()
 
 add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
@@ -325,12 +348,12 @@ else()
     message(STATUS "RetroRewind target disabled (run translate-mod and emit-build-shards)")
 endif()
 
-# Windows and Linux x86_64 share the x86-64-v3 floor that the CPU baseline
-# object above checks. AArch64 builds are compiled locally for the host that
-# will run them, so both Linux and Apple Silicon use the compiler's native CPU
-# tuning rather than leaving target-specific performance on the table.
+# Windows, Linux and Intel macOS x86_64 use the selected profile. AArch64
+# builds are compiled locally for the host that will run them, so both Linux
+# and Apple Silicon use the compiler's native CPU tuning rather than leaving
+# target-specific performance on the table.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-    set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3)
+    set(MKW_BASELINE_ARCH_FLAG -march=x86-64-${MKW_X86_CPU_PROFILE})
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
 else()
@@ -343,5 +366,8 @@ set(MKW_ALL_BUILD_TARGETS
 foreach(target IN LISTS MKW_ALL_BUILD_TARGETS)
     if(TARGET ${target} AND MKW_BASELINE_ARCH_FLAG)
         target_compile_options(${target} PRIVATE ${MKW_BASELINE_ARCH_FLAG})
+        if(MKW_X86_CPU_PROFILE STREQUAL "v2")
+            target_compile_definitions(${target} PRIVATE MKW_X86_CPU_PROFILE_V2=1)
+        endif()
     endif()
 endforeach()

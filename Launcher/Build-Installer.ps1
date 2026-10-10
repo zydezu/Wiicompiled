@@ -279,9 +279,12 @@ foreach ($required in @('ToolkitFingerprint','TranslationFingerprint','NativeToo
     if ([string]::IsNullOrWhiteSpace($identities.$required)) { throw "Payload identity output is missing $required." }
 }
 
+$productVersion = ((& $setupHost --version) -join '').Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($productVersion)) { throw 'The setup host did not report its version.' }
+
 $manifest = [ordered]@{
     SchemaVersion = 2
-    ProductVersion = '0.2.32'
+    ProductVersion = $productVersion
     ExpectedGameId = $pins.GameId
     ExpectedDolSha256 = $pins.DolSha256
     ExpectedRelSha256 = $pins.RelSha256

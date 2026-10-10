@@ -184,16 +184,29 @@ internal sealed class BuildProgressWindow
         }
 
         // Anything else - a plain MKWCBUILD note, or raw tool output - stays a diagnostic and only
-        // feeds the heartbeat below.
+        // feeds the compile progress below.
         _reporter.Diagnostic(line);
-        // Compilation announces itself once and then emits thousands of compiler lines. Treat that
-        // output as a heartbeat so the slice keeps creeping forward, but only publish a progress
-        // line when the rounded percentage actually changes.
-        if (_fraction >= CompileFraction)
+        // Compilation announces itself once and then ninja prefixes every edge with [done/total].
+        // Follow that counter rather than counting lines: how many lines a build prints depends on
+        // whether aurora and its dependencies are prebuilt (AppImage) or compiled here (macOS), so a
+        // fixed per-line step reached the top long before the game itself compiled.
+        if (_fraction >= CompileFraction && TryParseNinjaProgress(line, out var done, out var total))
         {
-            _fraction = Math.Min(0.97, _fraction + 0.0015);
+            _fraction = Math.Max(_fraction, CompileFraction + (0.97 - CompileFraction) * done / total);
             Emit();
         }
+    }
+
+    private static bool TryParseNinjaProgress(string line, out int done, out int total)
+    {
+        done = total = 0;
+        if (!line.StartsWith('[')) return false;
+        var close = line.IndexOf(']');
+        var slash = line.IndexOf('/');
+        return close > 0 && slash > 0 && slash < close
+            && int.TryParse(line.AsSpan(1, slash - 1), out done)
+            && int.TryParse(line.AsSpan(slash + 1, close - slash - 1), out total)
+            && total > 0 && done <= total;
     }
 
     private void Emit()
