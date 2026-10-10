@@ -287,18 +287,27 @@ TRANSLATOR_STAMP="generated/.translator-build-id"
 
 PUL_SHA=""
 if [ "$RETRO" = "1" ]; then
+    # Check the published version and only skip the check when explicitly asked
+    # (SKIP_RETRO_UPDATE_CHECK=1) or with an explicit RETRO_FULL_ZIP_URL override
+    NEED_RETRO_DOWNLOAD=0
     if [ ! -f "$RETRO_ROOT/Binaries/Code.pul" ]; then
-        # Needs the FULL pack (<version>-full2.zip), not the incremental
-        # RetroRewind.zip updater - that omits archives an existing install
-        # already has, leaving pause-menu pages missing. Set
-        # RETRO_FULL_ZIP_URL to override.
-        if [ -z "${RETRO_FULL_ZIP_URL:-}" ]; then
-            rr_version="$(curl -fsSL "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt" \
-                | grep -oE '^[0-9]+(\.[0-9]+)+' | tail -n1)"
-            [ -n "$rr_version" ] || { echo "error: could not determine the latest Retro Rewind version" >&2; exit 1; }
-            RETRO_FULL_ZIP_URL="https://cdn.update.rwfc.net/RetroRewind/zip/${rr_version}-full2.zip"
+        NEED_RETRO_DOWNLOAD=1
+    elif [ -n "${RETRO_FULL_ZIP_URL:-}" ]; then
+        NEED_RETRO_DOWNLOAD=1
+    elif [ "${SKIP_RETRO_UPDATE_CHECK:-0}" != "1" ]; then
+        rr_latest_version="$(curl -fsSL "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt" \
+            | grep -oE '^[0-9]+(\.[0-9]+)+' | tail -n1)"
+        rr_local_version=""
+        [ -f "$RETRO_ROOT/version.txt" ] && rr_local_version="$(tr -d '[:space:]' < "$RETRO_ROOT/version.txt")"
+        if [ -n "$rr_latest_version" ] && [ "$rr_latest_version" != "$rr_local_version" ]; then
+            echo "==> Retro Rewind $rr_local_version is outdated (latest: $rr_latest_version)"
+            NEED_RETRO_DOWNLOAD=1
         fi
-        echo "==> $RETRO_ROOT is missing Binaries/Code.pul; downloading the full Retro Rewind pack"
+    fi
+
+    if [ "$NEED_RETRO_DOWNLOAD" = "1" ]; then
+        RETRO_FULL_ZIP_URL="${RETRO_FULL_ZIP_URL:-https://update.rwfc.net/RetroRewind/zip/RetroRewind.zip}"
+        echo "==> downloading the full Retro Rewind pack"
         echo "    $RETRO_FULL_ZIP_URL"
         tmp_archive="$(mktemp --suffix=.zip)"
         tmp_extract="$(mktemp -d)"
@@ -500,8 +509,17 @@ if [ "$INSTALL" = "1" ]; then
     install_product() {
         local name="$1" binary="$2" is_retro="$3"
         local dest="$INSTALL_DIR/$name"
+        local nand_stash=""
+        if [ -d "$dest/UserData/NAND" ]; then
+            nand_stash="$(mktemp -d)"
+            mv "$dest/UserData/NAND" "$nand_stash/NAND"
+        fi
         rm -rf "$dest"
         mkdir -p "$dest/UserData"
+        if [ -n "$nand_stash" ]; then
+            mv "$nand_stash/NAND" "$dest/UserData/NAND"
+            rmdir "$nand_stash"
+        fi
         cp -f "$BUILD_DIR/$binary" "$BUILD_DIR/dsp_coef.bin" \
               "$BUILD_DIR/initial_pipeline_cache.db" "$dest/"
         cp -r "$BUILD_DIR/wii_bootstrap" "$dest/wii_bootstrap"

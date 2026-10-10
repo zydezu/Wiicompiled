@@ -196,20 +196,25 @@ TRANSLATOR_STAMP="generated/.translator-build-id"
 
 PUL_SHA=""
 if [ "$RETRO" = "1" ]; then
+    NEED_RETRO_DOWNLOAD=0
     if [ ! -f "$RETRO_ROOT/Binaries/Code.pul" ]; then
-        # The FULL pack (<version>-full2.zip on the CDN), not
-        # update.rwfc.net/.../RetroRewind.zip - that one is the in-game
-        # updater's incremental bundle and omits menu/UI archives an existing
-        # install already has, so Retro Rewind's pause menu ends up missing
-        # pages (page 0x19 -> null -> Page::Activate(null) crash). Set
-        # RETRO_FULL_ZIP_URL to override.
-        if [ -z "${RETRO_FULL_ZIP_URL:-}" ]; then
-            rr_version="$(curl -fsSL "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt" \
-                | grep -oE '^[0-9]+(\.[0-9]+)+' | tail -n1)"
-            [ -n "$rr_version" ] || { echo "error: could not determine the latest Retro Rewind version" >&2; exit 1; }
-            RETRO_FULL_ZIP_URL="https://cdn.update.rwfc.net/RetroRewind/zip/${rr_version}-full2.zip"
+        NEED_RETRO_DOWNLOAD=1
+    elif [ -n "${RETRO_FULL_ZIP_URL:-}" ]; then
+        NEED_RETRO_DOWNLOAD=1
+    elif [ "${SKIP_RETRO_UPDATE_CHECK:-0}" != "1" ]; then
+        rr_latest_version="$(curl -fsSL "https://update.rwfc.net/RetroRewind/RetroRewindVersion.txt" \
+            | grep -oE '^[0-9]+(\.[0-9]+)+' | tail -n1)"
+        rr_local_version=""
+        [ -f "$RETRO_ROOT/version.txt" ] && rr_local_version="$(tr -d '[:space:]' < "$RETRO_ROOT/version.txt")"
+        if [ -n "$rr_latest_version" ] && [ "$rr_latest_version" != "$rr_local_version" ]; then
+            echo "==> Retro Rewind $rr_local_version is outdated (latest: $rr_latest_version)"
+            NEED_RETRO_DOWNLOAD=1
         fi
-        echo "==> $RETRO_ROOT is missing Binaries/Code.pul; downloading the full Retro Rewind pack"
+    fi
+
+    if [ "$NEED_RETRO_DOWNLOAD" = "1" ]; then
+        RETRO_FULL_ZIP_URL="${RETRO_FULL_ZIP_URL:-https://update.rwfc.net/RetroRewind/zip/RetroRewind.zip}"
+        echo "==> downloading the full Retro Rewind pack"
         echo "    $RETRO_FULL_ZIP_URL"
         tmp_archive="$(mktemp --suffix=.zip)"
         tmp_extract="$(mktemp -d)"
