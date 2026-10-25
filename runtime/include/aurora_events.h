@@ -1,7 +1,10 @@
 #pragma once
 
+#include "friend_code_keyboard.h"
 #include "settings_overlay.h"
 #include "runtime_config.h"
+#include "gx_worker.h"
+#include "perf_stats.h"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
@@ -117,6 +120,7 @@ inline void ProcessAuroraEvents(const AuroraEvent* events) {
         g_mkwDynamicAspectSurfacePending.store(true, std::memory_order_release);
     }
     settings_overlay::HandleEvents(events);
+    FriendCodeKeyboard::HandleEvents(events);
 }
 
 inline void ApplyPendingMkwDynamicAspectSurface() {
@@ -131,12 +135,45 @@ inline void ApplyPendingMkwDynamicAspectSurface() {
     UpdateMkwDynamicAspectSurface(surfaceWidth, surfaceHeight);
 }
 
+void GxWorkerBeginFrame();
+void GxWorkerEndFrame(AuroraImguiFrame* imgui);
+void SetAuroraFrameGxBegun(bool begun);
+
 inline bool BeginAuroraFrame() {
+    if (GxWorker::ShouldDefer()) {
+        // The window half can touch the surface and render targets the worker draws into.
+        GxWorker::Sync();
+        bool begun = false;
+        {
+            PerfStats::WaitScope wait;
+            begun = aurora_begin_frame_window();
+        }
+        if (!begun) {
+            return false;
+        }
+        GxWorker::Submit([] { GxWorkerBeginFrame(); });
+        ApplyPendingMkwDynamicAspectSurface();
+        return true;
+    }
     if (!aurora_begin_frame()) {
         return false;
     }
+    SetAuroraFrameGxBegun(true);
     ApplyPendingMkwDynamicAspectSurface();
     return true;
+}
+
+// Ends the frame; with the GX worker, the game thread joins it here so the next frame never
+// overlaps guest memory the worker may still read.
+inline void EndAuroraFrame() {
+    if (GxWorker::ShouldDefer()) {
+        AuroraImguiFrame* imgui = aurora_end_frame_window();
+        GxWorker::Submit([imgui] { GxWorkerEndFrame(imgui); });
+        GxWorker::Sync();
+        return;
+    }
+    aurora_end_frame();
+    SetAuroraFrameGxBegun(false);
 }
 
 // Poll Aurora events and update cached window/framebuffer dimensions.

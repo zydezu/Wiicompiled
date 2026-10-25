@@ -490,9 +490,16 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
             const uint16_t vtxCount = ReadBE16(data + 1);
             const GXVtxFmt vtxFmt = static_cast<GXVtxFmt>(cmd & GX_VAT_MASK_CMD);
             const GXPrimitive prim = OpcodeToGXPrimitive(cmd);
+            if (vtxCount == 0) {
+                if (!consumeBytes(3, sink)) break;
+                continue;
+            }
             uint32_t rawVertexSize = 0;
-            if (TryGetRawDirectFifoVertexSize(vtxFmt, rawVertexSize)) {
-                const uint32_t packetBytes = 3u + static_cast<uint32_t>(vtxCount) * rawVertexSize;
+            const uint32_t packetBytes = TryGetRawDirectFifoVertexSize(vtxFmt, rawVertexSize)
+                ? 3u + static_cast<uint32_t>(vtxCount) * rawVertexSize
+                : 0u;
+            // A packet that cannot fit the buffer is streamed per vertex instead.
+            if (packetBytes != 0 && packetBytes <= g_hleGxState.fifoBytes.size()) {
                 if (g_hleGxState.fifoByteCount < packetBytes) {
                     break;
                 }
@@ -775,11 +782,25 @@ static bool WriteDisplayListBurst(const uint8_t* data, uint32_t sizeBytes) {
     return true;
 }
 
+static void FifoWriteBurstImpl(const uint8_t* data, uint32_t sizeBytes);
+
 extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) {
     if (data == nullptr || sizeBytes == 0) {
         return;
     }
+    if (GxWorker::ShouldDefer()) {
+        EnsureAuroraFrameForFifo();
+        GxWorker::FifoBurst(data, sizeBytes);
+        return;
+    }
+    FifoWriteBurstImpl(data, sizeBytes);
+}
 
+void GxWorkerReplayFifoWrite(uint32_t value, uint32_t sizeBytes) { HleFifoWrite(value, sizeBytes); }
+
+void GxWorkerReplayFifoBurst(const uint8_t* data, uint32_t sizeBytes) { FifoWriteBurstImpl(data, sizeBytes); }
+
+static void FifoWriteBurstImpl(const uint8_t* data, uint32_t sizeBytes) {
     if (IsDisplayListActive() && WriteDisplayListBurst(data, sizeBytes)) {
         return;
     }

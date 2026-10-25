@@ -21,14 +21,16 @@ namespace {
 constexpr uint32_t kDefaultSampleRate = 32000u;
 constexpr uint32_t kAudioChannels = 2u;
 constexpr uint32_t kBytesPerSample = 2u;
-constexpr uint32_t kAIInitializedAddr = 0x80386448u;
-constexpr uint32_t kAICallbackBusyAddr = 0x8038644Cu;
-constexpr uint32_t kAICallbackStackSwitchAddr = 0x8038647Cu;
-constexpr uint32_t kAIDmaCallbackAddr = 0x80386480u;
+const uint32_t kAIInitializedAddr = MKW_GADDR(80386448);
+const uint32_t kAICallbackBusyAddr = MKW_GADDR(8038644C);
+const uint32_t kAICallbackStackSwitchAddr = MKW_GADDR(8038647C);
+const uint32_t kAIDmaCallbackAddr = MKW_GADDR(80386480);
 
 // Max completed 3 ms DMA blocks delivered per tick. Draining several at once catches up
 // backlog from a long frame without letting a large stall spiral into an unbounded loop.
 constexpr int kMaxBlocksPerTick = 4;
+// Backlog (in blocks) tolerated before a catch-up block waits on an in-flight mix.
+constexpr double kMaxDeferredBlocks = 2.0;
 
 struct AIDmaState {
     std::mutex mutex;
@@ -407,11 +409,15 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
 
     int blocksCompleted = 0;
     while (true) {
+        // A block due while the previous mix is still running would block on it; leave it for the
+        // next service point unless the backlog is getting long.
+        const bool deferWhileMixing = AxDspHle::MixWorkerBusy();
         // Claim the block in one critical section; sample-then-consume separately gains
         // nothing since the callback below (the only reentrancy point) runs mutex-released.
         {
             std::lock_guard<std::mutex> lock(g_ai.mutex);
-            if (g_ai.accumulatorSeconds < blockDuration) {
+            if (g_ai.accumulatorSeconds < blockDuration ||
+                (deferWhileMixing && g_ai.accumulatorSeconds < blockDuration * kMaxDeferredBlocks)) {
                 break;
             }
             g_ai.accumulatorSeconds -= blockDuration;
@@ -497,19 +503,20 @@ int64_t ConsumeAudioPollDeltaMicros()
     using Clock = std::chrono::steady_clock;
     static thread_local Clock::time_point lastPoll = Clock::now();
 
-    const Clock::time_point now = Clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
-    lastPoll = now;
-
-    if (elapsed < 0) {
-        elapsed = 0;
-    }
-
     // Cap the catch-up interval after a debugger pause or host stall; backlog drains via
     // kMaxBlocksPerTick per pass. Never return early on a zero delta: two scheduler passes
     // can land in the same microsecond and the backlog still needs servicing.
-    constexpr int64_t kMaxPollDeltaMicros = 100'000;
-    return std::min(elapsed, kMaxPollDeltaMicros);
+    constexpr std::chrono::microseconds kMaxPollDelta{100'000};
+
+    const Clock::time_point now = Clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll);
+    if (elapsed.count() < 0 || elapsed > kMaxPollDelta) {
+        lastPoll = now;
+        return elapsed.count() < 0 ? 0 : kMaxPollDelta.count();
+    }
+    // Keep the sub-microsecond remainder for the next poll.
+    lastPoll += elapsed;
+    return elapsed.count();
 }
 
 } // namespace

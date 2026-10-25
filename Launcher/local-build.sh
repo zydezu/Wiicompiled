@@ -39,7 +39,7 @@ require_command() {
 }
 
 sha256_of() {
-    sha256sum "$1" | awk '{print $1}'
+    mkw_sha256 "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,8 @@ sha256_of() {
 # ---------------------------------------------------------------------------
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=build-cache.sh
+source "$script_dir/build-cache.sh"
 workspace=$(cd "$script_dir/.." && pwd)
 profile=base
 output_dir=""
@@ -66,6 +68,8 @@ translator_bin_override=""
 fuse_ld_override=""
 native_prebuilt_dir=""
 sysroot=""
+setup_version=""
+x86_cpu_profile=auto
 
 usage() {
     cat <<'EOF'
@@ -90,6 +94,10 @@ Usage: local-build.sh --output-dir DIR [options]
                                    skips compiling aurora-main from source entirely
   --sysroot PATH                   Passed to CMake as -DCMAKE_SYSROOT: where the compiler resolves
                                    standard headers/startup files
+  --setup-version VERSION          Version recorded in the runtime log (default: <Version> in
+                                   Launcher/Directory.Build.props when present)
+  --x86-cpu-profile {auto|v2|v3}   x86-64 instruction set to build for (default: auto, v3 when
+                                   this machine supports it)
 EOF
 }
 
@@ -114,15 +122,26 @@ while [[ $# -gt 0 ]]; do
         --translator-bin) translator_bin_override=$2; shift 2 ;;
         --native-prebuilt-dir) native_prebuilt_dir=$2; shift 2 ;;
         --sysroot) sysroot=$2; shift 2 ;;
+        --setup-version) setup_version=$2; shift 2 ;;
+        --x86-cpu-profile) x86_cpu_profile=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
 
+if [[ -z "$setup_version" && -f "$workspace/Launcher/Directory.Build.props" ]]; then
+    setup_version=$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' "$workspace/Launcher/Directory.Build.props" | head -n 1)
+fi
+[[ "$setup_version" =~ ^[0-9A-Za-z.+-]*$ ]] || fail "--setup-version contains unsupported characters"
+
 [[ -n "$output_dir" ]] || { usage; fail "--output-dir is required"; }
 case "$profile" in
     base|retro-rewind|both) ;;
     *) fail "--profile must be base, retro-rewind, or both" ;;
+esac
+case "$x86_cpu_profile" in
+    auto|v2|v3) ;;
+    *) fail "--x86-cpu-profile must be auto, v2, or v3" ;;
 esac
 
 builds_retro=0
@@ -173,7 +192,22 @@ if [[ -n "$native_prebuilt_dir" ]]; then
     assert_file "$native_prebuilt_dir/native_prebuilt.cmake" "Native prebuilt package"
 fi
 
-project=$workspace/projects/mkwii/recomp.yml
+host_supports_x86_64_v3() {
+    local macros macro
+    macros=$("$cc_bin" -march=native -dM -E -x c /dev/null 2>/dev/null) || return 1
+    for macro in __AVX__ __AVX2__ __BMI__ __BMI2__ __F16C__ __FMA__ __LZCNT__ __MOVBE__; do
+        grep -q "^#define $macro " <<<"$macros" || return 1
+    done
+}
+
+if [[ "$x86_cpu_profile" == "auto" ]]; then
+    x86_cpu_profile=v3
+    if [[ "$(uname -m)" == "x86_64" ]] && ! host_supports_x86_64_v3; then
+        x86_cpu_profile=v2
+        echo "MKWCBUILD: This CPU does not support x86-64-v3; building for x86-64-v2"
+    fi
+fi
+
 assets=$workspace/Assets
 generated=$workspace/generated
 functions=$generated/functions
@@ -186,9 +220,12 @@ translation_provenance=$generated/translation-provenance.json
 toolchain_provenance=$build/toolchain-provenance.json
 retro_root=${retro_rewind_package_dir:-$workspace/PulsarPacks/completed/RetroRewind/RetroRewind6}
 
-assert_file "$project" "Translation project"
 assert_file "$assets/main.dol" "Extracted main.dol (see translator/README.md - owning the game is required)"
 assert_file "$assets/StaticR.rel" "Extracted StaticR.rel (see translator/README.md - owning the game is required)"
+# The translation project is the one pinned to the extracted main.dol, which decides the region.
+project=$(mkw_resolve_project "$workspace" "$assets") || fail "the extracted game cannot be translated"
+region=$(mkw_project_pin "$project" region)
+[[ -n "$region" ]] || fail "Could not find the region of $project"
 
 # The AppImage bundles Clang, but Linux startup objects and the C/C++ link runtimes
 # still come from the host. Check them before the expensive translation so a missing
@@ -266,10 +303,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Translation cache: this script is the only owner of the reuse decision (unlike LocalBuild.ps1,
-# which is handed caller-computed fingerprints by the Windows installer - there is no Linux
-# installer yet to supply anything). Hash the game inputs the translation actually depends on;
-# a match plus every expected output file present means the previous translation is still good.
+# Translation cache: this script is the only owner of the reuse decision. The identity (see
+# build-cache.sh) covers the game inputs, project, native registrations, translator and this script,
+# matching the Windows installer's translation identity.
 # ---------------------------------------------------------------------------
 
 if (( force_clean_build )); then
@@ -277,13 +313,12 @@ if (( force_clean_build )); then
     rm -rf "$generated" "$base_manifest_dir" "$build"
 fi
 
-translation_fingerprint=$(cat "$assets/main.dol" "$assets/StaticR.rel" "$project" | sha256sum | awk '{print $1}')
+translator_identity_input=${translator_bin:-$(dirname "$translator_dll")}
+translation_fingerprint=$(mkw_translation_identity "$workspace" "$translator_identity_input" "$script_dir/local-build.sh")
 reuse_base=0
-if [[ -f "$translation_provenance" ]]; then
-    recorded=$(grep -o '"TranslationFingerprint" *: *"[^"]*"' "$translation_provenance" 2>/dev/null | sed 's/.*"\([0-9a-f]*\)"$/\1/' || true)
-    if [[ "$recorded" == "$translation_fingerprint" && -f "$base_metadata" && -f "$base_manifest" ]]; then
-        reuse_base=1
-    fi
+if [[ "$(mkw_read_identity "$translation_provenance" TranslationFingerprint)" == "$translation_fingerprint" \
+      && -f "$base_metadata" && -f "$base_manifest" ]]; then
+    reuse_base=1
 fi
 
 if (( builds_retro )); then
@@ -329,10 +364,9 @@ else
 
     log_step emit-base-manifest "Creating the local base translation manifest"
     translator emit-base-manifest --project "$project" --out "$base_manifest_dir" \
-        --functions-dir "$functions" --translation-output-metadata "$base_metadata" --region P
+        --functions-dir "$functions" --translation-output-metadata "$base_metadata" --region "$region"
 
-    printf '{"SchemaVersion":1,"TranslationFingerprint":"%s"}' "$translation_fingerprint" \
-        > "$translation_provenance"
+    mkw_write_identity "$translation_provenance" TranslationFingerprint "$translation_fingerprint"
 fi
 
 if (( builds_retro )); then
@@ -342,12 +376,13 @@ if (( builds_retro )); then
     translate_mod_args=(translate-mod --project "$project" --profile retro-rewind
         --base-manifest "$base_manifest" --base-translation-output-metadata "$base_metadata"
         --code-pul "$code_pul" --mod-root "$retro_root" --mod-name "Retro Rewind"
-        --region P --out "$retro_out" --prefer-cached-inputs --emit-cpp
+        --region "$region" --out "$retro_out" --prefer-cached-inputs --emit-cpp
         --threads "$translator_threads")
     if (( skip_retro_wfc_payload )); then
         translate_mod_args+=(--skip-retro-wfc)
     else
-        offline_payload=$retro_wfc_offline_dir/binary/payload.RMCPD00.bin
+        payload_file=$(mkw_retro_wfc_payload_file "$project") || fail "$project pins no Retro-WFC payload"
+        offline_payload=$retro_wfc_offline_dir/$payload_file
         assert_file "$offline_payload" "Offline Retro-WFC shared payload"
         translate_mod_args+=(--retro-wfc-payload "$offline_payload")
     fi
@@ -407,6 +442,13 @@ if [[ -f "$build/CMakeCache.txt" ]]; then
         done < <(grep -o ':FILEPATH=.*' "$build/CMakeCache.txt" | sed 's/^:FILEPATH=//')
     fi
 fi
+# The AppImage keeps tool paths stable across updates, so a changed compiler is only visible here.
+toolchain_fingerprint=$(mkw_toolchain_identity "$workspace" "$cc_bin" "$cxx_bin" "$cmake_bin" "$ninja_bin")
+if [[ "$keep_native_build" -eq 1 && \
+      "$(mkw_read_identity "$toolchain_provenance" ToolchainFingerprint)" != "$toolchain_fingerprint" ]]; then
+    keep_native_build=0
+    stale_reason=" (the toolchain or a pinned dependency changed)"
+fi
 if [[ -d "$build" && "$keep_native_build" -eq 0 ]]; then
     echo "MKWCBUILD: The native build cache does not belong to this workspace path or toolchain; rebuilding from scratch$stale_reason"
     rm -rf "$build"
@@ -418,7 +460,9 @@ configure_args=(-S "$workspace/runtime" -B "$build" -G Ninja
     -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_C_COMPILER="$cc_bin" -DCMAKE_CXX_COMPILER="$cxx_bin"
     -DCMAKE_MAKE_PROGRAM="$ninja_bin"
-    -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs")
+    -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs"
+    -DMKW_SETUP_VERSION="$setup_version"
+    -DMKW_X86_CPU_PROFILE="$x86_cpu_profile")
 # CMAKE_C_COMPILER/CXX_COMPILER stay stable across AppImage runs on their own (they're exactly
 # what's passed via -D above, and AppRun points --cc/--cxx at a symlink it re-targets at the
 # current mount every launch - see build-appimage.sh). CMAKE_AR/RANLIB/LINKER/ASM_COMPILER do NOT
@@ -437,7 +481,9 @@ if [[ "$cc_bin" == */* ]]; then
     configure_args+=(-DCMAKE_ASM_COMPILER="$cc_bin")
 fi
 if [[ -n "$fuse_ld_override" ]]; then
-    configure_args+=(-DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=$fuse_ld_override")
+    # CMAKE_EXE_LINKER_FLAGS is one string that CMake pastes into the shell link command.
+    printf -v fuse_ld_quoted '%q' "$fuse_ld_override"
+    configure_args+=(-DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=$fuse_ld_quoted")
 fi
 if [[ -n "$native_prebuilt_dir" ]]; then
     configure_args+=(-DMKW_NATIVE_PREBUILT_DIR="$native_prebuilt_dir")
@@ -453,6 +499,7 @@ fi
 
 log_step configure-native "Configuring the native toolchain"
 "$cmake_bin" "${configure_args[@]}"
+mkw_write_identity "$toolchain_provenance" ToolchainFingerprint "$toolchain_fingerprint"
 
 case "$profile" in
     base) targets=(WiiCompiled) ;;

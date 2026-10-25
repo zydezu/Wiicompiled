@@ -148,10 +148,22 @@ copy_clean "$script_dir/setup.command" "$resources/setup.command"; chmod +x "$re
 mkdir -p "$resources/workspace"
 for source in aurora-main projects runtime translator; do
     [[ -d "$workspace/$source" ]] || fail "required workspace directory is missing: $source"
+    [[ "$source" != aurora-main || -f "$workspace/$source/CMakeLists.txt" ]] ||
+        fail "aurora-main is empty; run git submodule update --init --recursive"
     copy_clean "$workspace/$source" "$resources/workspace/$source"
 done
+# Setup bundles contain materialized sources and must work without Git.
+find "$resources/workspace" -name .git -prune -exec rm -rf {} +
+# The translation identity (build-cache.sh) covers the runtime's native registrations through this
+# index, so it is extracted from exactly the packaged runtime sources.
+if [[ "$host_arch" == arm64 ]]; then host_translator=$translator_arm64; else host_translator=$translator_x86_64; fi
+"$host_translator" emit-native-index --native-source-dir "$resources/workspace/runtime/src" \
+    --out "$resources/workspace/runtime/native-index.json" || fail 'the runtime native index could not be extracted'
+[[ -f "$resources/workspace/runtime/native-index.json" ]] || fail 'the runtime native index was not written'
 mkdir -p "$resources/workspace/Launcher/macos"
+copy_clean "$workspace/Launcher/Directory.Build.props" "$resources/workspace/Launcher/Directory.Build.props"
 copy_clean "$workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/local-build-macos.command"
+copy_clean "$workspace/Launcher/build-cache.sh" "$resources/workspace/Launcher/build-cache.sh"
 copy_clean "$workspace/Launcher/macos/extract-disc.command" "$resources/workspace/Launcher/macos/extract-disc.command"
 copy_clean "$workspace/Launcher/macos/publish-app.command" "$resources/workspace/Launcher/macos/publish-app.command"
 chmod +x "$resources/workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/macos/"*.command

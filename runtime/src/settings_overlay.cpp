@@ -1,4 +1,5 @@
 #include "settings_overlay.h"
+#include "gx_worker.h"
 #include "audio_backend.h"
 #include "aurora_events.h"
 #include "controller_button_names.h"
@@ -9,7 +10,7 @@
 #include "music_attenuation.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
-#include "wii_remote_input.h"
+#include "wiimote_host.h"
 
 #include <imgui.h>
 #include <SDL3/SDL_events.h>
@@ -75,6 +76,7 @@ const char* GraphicsApiDisplayName() {
 
 bool g_topBarVisible = false;
 bool g_exitPromptOpen = false;
+bool g_restartPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
@@ -109,6 +111,7 @@ int g_displayMode = [] {
     return static_cast<int>(AURORA_DISPLAY_MODE_WINDOWED);
 }();
 bool g_skipUnreadyPipelines = RuntimeConfigFile::SkipUnreadyPipelines(true);
+bool g_vsync = RuntimeConfigFile::Vsync();
 bool g_disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
 bool g_showFps = RuntimeConfigFile::ShowFps(true);
 bool g_forceAspect169 = RuntimeConfigFile::ForceAspect169Enabled();
@@ -189,6 +192,7 @@ bool IsHighFrameRateMode() {
 }
 
 void SetResolutionScale(float scale) {
+    GX_SYNC_INLINE();
     g_resolutionScale = scale;
     VISetFrameBufferScale(scale);
     RuntimeConfigFile::SetResolutionMultiplier(scale);
@@ -260,9 +264,9 @@ void ApplyConfiguredMappings() {
         // they describe whatever pad the user set them up with (usually an Xbox
         // layout: a = south). A Wii U Pro Controller has a fixed, known layout
         // (A on the east position) that aurora already maps by name; applying
-        // the shared bindings on top swaps A/B and X/Y. (Wii Remotes with any
-        // extension never reach the PAD layer: the game reads them through KPAD.)
-        if (WiiRemoteInput::KindForPort(port) == WiiRemoteInput::Kind::WiiUPro) {
+        // the shared bindings on top swaps A/B and X/Y.
+        if (const char* name = PADGetNameForControllerIndex(static_cast<uint32_t>(controllerIndex));
+            name != nullptr && std::string_view(name).find("Wii U Pro") != std::string_view::npos) {
             continue;
         }
 
@@ -296,138 +300,124 @@ void ApplyConfiguredMappings() {
     }
 }
 
-bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled(true);
-bool g_wiiContinuousScan = RuntimeConfigFile::WiiContinuousScanEnabled(false);
+bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled();
+const bool g_wiiRemotesAtLaunch = g_wiiRemotesEnabled;
+bool g_wiiRemotesSaveFailed = false;
+bool g_wiiAutoPair = RuntimeConfigFile::WiiAutoPairEnabled(true);
+bool g_wiiSensorBarAbove = RuntimeConfigFile::WiiSensorBarAbove(false);
+int g_wiiIrSensitivity = RuntimeConfigFile::WiiIrSensitivity(3);
 
-// Accelerometer readout and zero-point calibration for a bare remote / remote + Nunchuk.
-void DrawWiiRemoteAccelerometer(uint32_t port) {
-    ImGui::SeparatorText("Accelerometer");
-    float sdlG[3] = {};
-    float kpad[3] = {};
-    if (WiiRemoteInput::ReadAccelDebug(port, sdlG, kpad)) {
-        ImGui::Text("KPAD acc: x %+.2f  y %+.2f  z %+.2f g", kpad[0], kpad[1], kpad[2]);
-        ImGui::TextDisabled("Flat, buttons up: (0, -1, 0). Sideways as a wheel: (1, 0, 0); z follows the turn.");
-    } else {
-        ImGui::TextDisabled("No accelerometer data yet.");
-    }
-    // SDL's read of the remote's calibration block often times out over Bluetooth
-    // and it falls back to a nominal zero point, leaving a small per-axis bias;
-    // measured here with the remote at rest.
-    if (WiiRemoteInput::IsAccelCalibrating()) {
-        ImGui::ProgressBar(WiiRemoteInput::AccelCalibrationProgress(), ImVec2(220.0f, 0.0f), "Hold still...");
-    } else if (ImGui::Button("Calibrate (remote lying flat, buttons up)")) {
-        WiiRemoteInput::StartAccelCalibration(port);
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Put the remote down on a flat surface with the buttons facing up and do not touch it\n"
-                          "for about two seconds. Corrects the steering offset of a remote held sideways.");
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!RuntimeConfigFile::HasWiiAccelOffset() || WiiRemoteInput::IsAccelCalibrating());
-    if (ImGui::Button("Clear calibration")) {
-        WiiRemoteInput::ClearAccelCalibration();
-    }
-    ImGui::EndDisabled();
-    if (const char* message = WiiRemoteInput::AccelCalibrationMessage()) {
-        ImGui::TextWrapped("%s", message);
-    } else if (RuntimeConfigFile::HasWiiAccelOffset()) {
-        const std::array<double, 3> offset = RuntimeConfigFile::WiiAccelOffset();
-        ImGui::TextDisabled("Stored offset: x %+.3f  y %+.3f  z %+.3f g", offset[0], offset[1], offset[2]);
-    } else {
-        ImGui::TextDisabled("Not calibrated (using SDL's zero point; see console.log for \"fallback accelerometer calibration\").");
-    }
+
+constexpr float kControllerMenuWidth = 460.0f;
+
+void PushMenuTextWrap() {
+    ImGui::PushTextWrapPos(0.0f);
 }
 
-// Wii Remotes (Bluetooth) menu: driver switch, pairing help, continuous scanning and the port's controller kind.
-void DrawWiiRemoteSettings(uint32_t selectedGamePort) {
-    if (!ImGui::BeginMenu("Wii Remotes (Bluetooth)")) {
+std::string WiiRemoteLabel(const Wiimote::SlotInfo& info) {
+    std::string label = info.model;
+    if (!info.extension.empty()) {
+        label += " + " + info.extension;
+    }
+    return label;
+}
+
+// Pairing, the console's Wii Remote settings and the driver switch; applies to every remote.
+void DrawWiiRemoteSetup() {
+    if (!ImGui::CollapsingHeader("Wii Remote setup (Bluetooth)")) {
         return;
     }
-    if (ImGui::Checkbox("Use Wii Remotes / Wii U Pro Controllers", &g_wiiRemotesEnabled)) {
-        RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
+    ImGui::Indent();
+    PushMenuTextWrap();
+    const std::string notice = Wiimote::PlatformNotice();
+    if (!notice.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "%s", notice.c_str());
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Takes effect on the next launch. Turn this off if you use a Mayflash DolphinBar.");
+    const Wiimote::PairingInfo pairing = Wiimote::Pairing();
+    if (pairing.supported) {
+        ImGui::TextUnformatted("Press the red SYNC button (or 1 and 2) on the Wii Remote, like on a Wii.");
+        ImGui::TextDisabled("Paired before? Just press any button on it.");
+    } else if (g_wiiRemotesEnabled) {
+        ImGui::TextUnformatted("Pair the Wii Remote in your system's Bluetooth settings, then press any button on it.");
     }
-    ImGui::TextDisabled("Pairing: Windows Settings > Bluetooth > Add device, then press 1+2");
-    ImGui::TextDisabled("(or the red SYNC button) on the remote. Leave the PIN empty.");
-    ImGui::TextDisabled("A remote that was paired before also needs to be turned on with 1+2/SYNC.");
-    if (ImGui::Checkbox("Keep scanning for Wii Remotes (like Dolphin's Continuous Scanning)",
-                        &g_wiiContinuousScan)) {
-        RuntimeConfigFile::SetWiiContinuousScanEnabled(g_wiiContinuousScan);
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("While no Wii controller is connected, re-check Bluetooth every 2 seconds so a\n"
-                          "remote that dropped out (\"Communications with the controller have been\n"
-                          "interrupted\") or was turned on after launch comes back by itself.");
-    }
-    // The driver hint is only read at launch, so a rescan after the user turned
-    // the setting off would still re-enumerate Wii devices in this session.
-    ImGui::BeginDisabled(!g_wiiRemotesEnabled);
-    if (ImGui::Button("Rescan now")) {
-        WiiRemoteInput::RescanNow();
+    ImGui::PopTextWrapPos();
+    ImGui::BeginDisabled(!pairing.supported);
+    if (ImGui::Button("Pair a Wii Remote")) {
+        Wiimote::StartPairing();
     }
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Searches for a minute, like pressing SYNC on the console.");
+    }
     ImGui::SameLine();
-    if (WiiRemoteInput::IsScanning()) {
-        ImGui::TextDisabled("Scanning... (%u so far) - press 1+2 on the remote", WiiRemoteInput::ScanCount());
+    if (pairing.searching) {
+        ImGui::TextDisabled("Searching...");
+    } else if (!pairing.status.empty()) {
+        ImGui::TextDisabled("%s", pairing.status.c_str());
+    }
+    if (const size_t waiting = Wiimote::WaitingRemotes(); waiting != 0) {
+        ImGui::TextDisabled("%zu more Wii Remote%s connected; joins when a player leaves.", waiting,
+                            waiting == 1 ? "" : "s");
+    }
+    if (ImGui::Checkbox("Look for Wii Remotes automatically", &g_wiiAutoPair)) {
+        RuntimeConfigFile::SetWiiAutoPairEnabled(g_wiiAutoPair);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("While no Wii Remote is connected, keep searching for one in pairing mode.\n"
+                          "Searching can briefly disturb Bluetooth headphones.");
+    }
+    ImGui::SetNextItemWidth(160.0f);
+    int sensorBar = g_wiiSensorBarAbove ? 1 : 0;
+    if (ImGui::Combo("Sensor bar", &sensorBar, "Below TV\0Above TV\0")) {
+        g_wiiSensorBarAbove = sensorBar == 1;
+        RuntimeConfigFile::SetWiiSensorBarAbove(g_wiiSensorBarAbove);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Takes effect the next time the game starts.");
+    }
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::SliderInt("Pointer sensitivity", &g_wiiIrSensitivity, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp)) {
+        RuntimeConfigFile::SetWiiIrSensitivity(g_wiiIrSensitivity);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The sensor bar sensitivity from the Wii settings.\nTakes effect the next time the game starts.");
+    }
+    if (ImGui::Checkbox("Use Wii Remotes", &g_wiiRemotesEnabled)) {
+        g_wiiRemotesSaveFailed = !RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
+        if (g_wiiRemotesSaveFailed) g_wiiRemotesEnabled = !g_wiiRemotesEnabled;
+        g_restartPromptOpen = g_wiiRemotesEnabled != g_wiiRemotesAtLaunch && !g_wiiRemotesSaveFailed;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Takes effect after restarting the game. Turn this off to use a Wii U Pro Controller as a gamepad.");
+    }
+    if (g_wiiRemotesSaveFailed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Could not save this setting to Config.toml.");
+    }
+    if (g_wiiRemotesEnabled != g_wiiRemotesAtLaunch) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Restart the game to apply this change.");
+    }
+    ImGui::Unindent();
+}
+
+// The Wii Remote the game has on this player's channel.
+void DrawWiiRemoteDetails(uint32_t port, const Wiimote::SlotInfo& info) {
+    ImGui::Text("%s", WiiRemoteLabel(info).c_str());
+    if (info.battery >= 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Battery %d/4", info.battery);
+    }
+    PushMenuTextWrap();
+    if (info.asleep) {
+        ImGui::TextUnformatted("Disconnected by the game. Press any button on it to reconnect.");
+    } else if (info.link == Bluetooth::LinkState::Ready) {
+        ImGui::TextUnformatted("The game reads it like a real Wii Remote. Nothing to set up.");
     } else {
-        ImGui::TextDisabled("Not scanning");
+        ImGui::TextUnformatted("Connecting to the game...");
     }
-    ImGui::Separator();
-
-    const WiiRemoteInput::Kind kind = WiiRemoteInput::KindForPort(selectedGamePort);
-    ImGui::Text("Port %u: %s", static_cast<unsigned>(selectedGamePort + 1), WiiRemoteInput::KindLabel(kind));
-    if (kind == WiiRemoteInput::Kind::RemoteWithClassic) {
-        WiiRemoteInput::KpadSample sample;
-        if (WiiRemoteInput::ReadKpadSample(selectedGamePort, sample)) {
-            // WPAD_CL_BUTTON_* bits, in the game's own layout (no mapping involved).
-            const auto held = [&](uint32_t bit, const char* on, const char* off) { return (sample.clHold & bit) ? on : off; };
-            ImGui::Text("Classic: %s %s %s %s  %s %s  %s %s  %s %s  %s %s %s %s", held(0x0010, "A", "a"),
-                        held(0x0040, "B", "b"), held(0x0008, "X", "x"), held(0x0020, "Y", "y"), held(0x2000, "L", "l"),
-                        held(0x0200, "R", "r"), held(0x0080, "ZL", "zl"), held(0x0004, "ZR", "zr"),
-                        held(0x0400, "PLUS", "plus"), held(0x1000, "MINUS", "minus"), held(0x0001, "UP", "up"),
-                        held(0x4000, "DOWN", "down"), held(0x0002, "LEFT", "left"), held(0x8000, "RIGHT", "right"));
-            ImGui::Text("Sticks: L %+.2f %+.2f (WPAD %+d %+d)  R %+.2f %+.2f (WPAD %+d %+d)", sample.clLStick[0],
-                        sample.clLStick[1], static_cast<int>(sample.clLStickRaw[0]),
-                        static_cast<int>(sample.clLStickRaw[1]), sample.clRStick[0], sample.clRStick[1],
-                        static_cast<int>(sample.clRStickRaw[0]), static_cast<int>(sample.clRStickRaw[1]));
-            ImGui::TextDisabled("Capitals = held. The game reads this Classic Controller through KPAD, as on the");
-            ImGui::TextDisabled("console: its buttons mean what the game says they mean, no mapping applies.");
-        }
+    ImGui::PopTextWrapPos();
+    if (!info.asleep && ImGui::Button("Disconnect")) {
+        Wiimote::Disconnect(port);
     }
-    if (kind == WiiRemoteInput::Kind::WiiUPro) {
-        if (SDL_Gamepad* gamepad = SDL_GetGamepadFromPlayerIndex(static_cast<int>(selectedGamePort))) {
-            // SDL's Wii driver posts the D-pad as joystick buttons 11-14 (the
-            // SDL_GAMEPAD_BUTTON_DPAD_* values) while its default HIDAPI mapping
-            // expects a hat, so SDL_GetGamepadButton never sees them; read the
-            // joystick directly, like the fallback in aurora's PADRead does.
-            SDL_Joystick* joystick = SDL_GetGamepadJoystick(gamepad);
-            const auto rawButton = [&](int index) {
-                return joystick != nullptr && SDL_GetJoystickButton(joystick, index);
-            };
-            ImGui::Text("Raw D-pad: %s %s %s %s", rawButton(SDL_GAMEPAD_BUTTON_DPAD_UP) ? "UP" : "up",
-                        rawButton(SDL_GAMEPAD_BUTTON_DPAD_DOWN) ? "DOWN" : "down",
-                        rawButton(SDL_GAMEPAD_BUTTON_DPAD_LEFT) ? "LEFT" : "left",
-                        rawButton(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) ? "RIGHT" : "right");
-            ImGui::Text("Raw face buttons: %s %s %s %s", rawButton(SDL_GAMEPAD_BUTTON_EAST) ? "A" : "a",
-                        rawButton(SDL_GAMEPAD_BUTTON_SOUTH) ? "B" : "b", rawButton(SDL_GAMEPAD_BUTTON_NORTH) ? "X" : "x",
-                        rawButton(SDL_GAMEPAD_BUTTON_WEST) ? "Y" : "y");
-            ImGui::Text("Raw ZL/ZR: %d / %d (pressed above 0)",
-                        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
-                        SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-            ImGui::TextDisabled("Capitals = held. If a button never turns to capitals while physically held,");
-            ImGui::TextDisabled("that press is not reaching SDL at all (a driver-level issue, not a mapping one).");
-            ImGui::TextDisabled("This pad uses Nintendo's own layout (a/b/x/y as labelled); the shared");
-            ImGui::TextDisabled("button mapping above does not apply to it.");
-        }
-    }
-    if (kind == WiiRemoteInput::Kind::Remote || kind == WiiRemoteInput::Kind::RemoteWithNunchuk ||
-        kind == WiiRemoteInput::Kind::RemoteWithClassic) {
-        DrawWiiRemoteAccelerometer(selectedGamePort);
-    }
-
-    ImGui::EndMenu();
 }
 
 const char* KeyBindingName(int scancode) {
@@ -594,65 +584,74 @@ void DrawKeyBinding(const char* label, int scancode, RebindKind kind, uint16_t t
 
 }
 
-bool DrawKeyboardSettings(uint32_t port) {
+void ApplyKeyboardPreset(uint32_t port) {
+    const std::array<int, PAD_BUTTON_COUNT> keys = {
+        PAD_KEY_MOUSE_LEFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_E, SDL_SCANCODE_Q,
+        SDL_SCANCODE_RETURN, PAD_KEY_MOUSE_MIDDLE, SDL_SCANCODE_LSHIFT, PAD_KEY_MOUSE_RIGHT,
+        SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
+    };
+    for (size_t i = 0; i < keys.size(); ++i)
+        PADSetKeyButtonBinding(port, {keys[i], kControllerButtons[i].padButton});
+    const std::array<int, PAD_AXIS_COUNT> axes = {
+        SDL_SCANCODE_D, SDL_SCANCODE_A, SDL_SCANCODE_W, SDL_SCANCODE_S,
+        SDL_SCANCODE_L, SDL_SCANCODE_J, SDL_SCANCODE_I, SDL_SCANCODE_K,
+        SDL_SCANCODE_LSHIFT, PAD_KEY_MOUSE_RIGHT,
+    };
+    uint32_t axisCount = 0;
+    auto* mappings = PADGetKeyAxisBindings(port, &axisCount);
+    for (uint32_t i = 0; i < axisCount; ++i)
+        PADSetKeyAxisBinding(port, {axes[i], mappings[i].padAxis, 1});
+    PADSerializeMappings();
+}
+
+bool KeyboardActive(uint32_t port) {
+    uint32_t count = 0;
+    return PADGetKeyButtonBindings(port, &count) != nullptr;
+}
+
+void SetKeyboardActive(uint32_t port, bool active) {
+    if (KeyboardActive(port) == active) return;
+    PADSetKeyboardActive(port, active);
+    PADSerializeMappings();
     uint32_t count = 0;
     auto* buttons = PADGetKeyButtonBindings(port, &count);
-    bool enabled = buttons != nullptr;
-    bool usePreset = false;
-    if (ImGui::Checkbox("Keyboard and mouse", &enabled)) {
-        PADSetKeyboardActive(port, enabled);
-        PADSerializeMappings();
-        buttons = PADGetKeyButtonBindings(port, &count);
-        usePreset = enabled && std::all_of(buttons, buttons + count, [](const auto& binding) {
+    if (active && buttons != nullptr && std::all_of(buttons, buttons + count, [](const auto& binding) {
             return binding.scancode == PAD_KEY_INVALID;
-        });
+        })) {
+        ApplyKeyboardPreset(port);
     }
-    if (!enabled) return false;
-    ImGui::TextDisabled("Replaces the gamepad on this port. F10 opens settings.");
-    if (ImGui::Button("Use WASD + mouse preset") || usePreset) {
-        const std::array<int, PAD_BUTTON_COUNT> keys = {
-            PAD_KEY_MOUSE_LEFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_E, SDL_SCANCODE_Q,
-            SDL_SCANCODE_RETURN, PAD_KEY_MOUSE_MIDDLE, SDL_SCANCODE_LSHIFT, PAD_KEY_MOUSE_RIGHT,
-            SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
-        };
-        for (size_t i = 0; i < keys.size(); ++i)
-            PADSetKeyButtonBinding(port, {keys[i], kControllerButtons[i].padButton});
-        const std::array<int, PAD_AXIS_COUNT> axes = {
-            SDL_SCANCODE_D, SDL_SCANCODE_A, SDL_SCANCODE_W, SDL_SCANCODE_S,
-            SDL_SCANCODE_L, SDL_SCANCODE_J, SDL_SCANCODE_I, SDL_SCANCODE_K,
-            SDL_SCANCODE_LSHIFT, PAD_KEY_MOUSE_RIGHT,
-        };
-        uint32_t axisCount = 0;
-        auto* mappings = PADGetKeyAxisBindings(port, &axisCount);
-        for (uint32_t i = 0; i < axisCount; ++i)
-            PADSetKeyAxisBinding(port, {axes[i], mappings[i].padAxis, 1});
-        PADSerializeMappings();
-    }
-    ImGui::SeparatorText("Button mapping");
-    for (uint32_t i = 0; i < count; ++i) {
-        int key = buttons[i].scancode;
+}
+
+void DrawKeyboardSettings(uint32_t port) {
+    PushMenuTextWrap();
+    ImGui::TextUnformatted("Default: WASD to steer, mouse left to accelerate, Space to brake.");
+    ImGui::PopTextWrapPos();
+    if (!ImGui::CollapsingHeader("Customize keys")) return;
+    ImGui::Indent();
+    if (ImGui::Button("Reset to WASD + mouse")) ApplyKeyboardPreset(port);
+    uint32_t count = 0;
+    auto* buttons = PADGetKeyButtonBindings(port, &count);
+    ImGui::SeparatorText("Buttons");
+    for (uint32_t i = 0; buttons != nullptr && i < count; ++i) {
         ImGui::PushID(static_cast<int>(i));
-        ImGui::SetNextItemWidth(220.0f);
-        DrawKeyBinding(PADGetButtonName(buttons[i].padButton), key, RebindKind::KeyboardButton, buttons[i].padButton);
+        DrawKeyBinding(PADGetButtonName(buttons[i].padButton), buttons[i].scancode, RebindKind::KeyboardButton,
+                       buttons[i].padButton);
         ImGui::PopID();
     }
-    ImGui::SeparatorText("Stick and trigger mapping");
+    ImGui::SeparatorText("Sticks and triggers");
     uint32_t axisCount = 0;
     auto* axes = PADGetKeyAxisBindings(port, &axisCount);
-    for (uint32_t i = 0; i < axisCount; ++i) {
-        int key = axes[i].scancode;
+    for (uint32_t i = 0; axes != nullptr && i < axisCount; ++i) {
         ImGui::PushID(static_cast<int>(count + i));
         const char* direction = PADGetAxisDirectionLabel(axes[i].padAxis);
         const std::string label = std::string(PADGetAxisName(axes[i].padAxis)) + " " +
                                   (direction != nullptr ? direction : "");
-        ImGui::SetNextItemWidth(220.0f);
-        DrawKeyBinding(label.c_str(), key, RebindKind::KeyboardAxis, axes[i].padAxis);
+        DrawKeyBinding(label.c_str(), axes[i].scancode, RebindKind::KeyboardAxis, axes[i].padAxis);
         ImGui::PopID();
     }
-    return true;
+    ImGui::Unindent();
 }
 
-// Controller settings menu: port selection, controller assignment and button mapping.
 int ExpressionResizeCallback(ImGuiInputTextCallbackData* data) {
     if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
         auto* text = static_cast<std::string*>(data->UserData);
@@ -663,7 +662,6 @@ int ExpressionResizeCallback(ImGuiInputTextCallbackData* data) {
 }
 
 void DrawExpressionSettings() {
-    ImGui::SeparatorText("Expressions (Dolphin syntax)");
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 440.0f);
     ImGui::TextDisabled(
         "Optional. An expression overrides nothing: its result is combined with the "
@@ -729,7 +727,7 @@ void DrawExpressionSettings() {
 }
 
 void DrawRumbleSettings() {
-    ImGui::SeparatorText("Vibration");
+    ImGui::Separator();
     if (ImGui::Checkbox("Controller vibration", &g_rumbleEnabled)) {
         PAD_HLE_SetRumbleEnabled(g_rumbleEnabled);
         RuntimeConfigFile::SetRumbleEnabled(g_rumbleEnabled);
@@ -747,60 +745,15 @@ void DrawRumbleSettings() {
     }
 }
 
-void DrawControllerSettings() {
-    for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
-        const std::string label = "Port " + std::to_string(port + 1);
-        ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
-        if (port + 1 < PAD_MAX_CONTROLLERS) {
-            ImGui::SameLine();
-        }
-    }
-
-    ImGui::Separator();
-    const uint32_t selectedGamePort = static_cast<uint32_t>(g_controllerPort);
-    if (DrawKeyboardSettings(selectedGamePort)) {
-        return;
-    }
-    ImGui::Separator();
-    const char* currentName = PADGetName(selectedGamePort);
-    ImGui::Text("Assigned: %s", currentName != nullptr ? currentName : "None");
-    if (ImGui::MenuItem("Unassign controller")) {
-        PADClearPort(selectedGamePort);
-        g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
-    }
-    ImGui::Separator();
-    controller_mapping_wizard::DrawSetupList();
-    DrawWiiRemoteSettings(selectedGamePort);
-    const uint32_t controllerCount = PADCount();
-    if (controllerCount == 0) {
-        ImGui::TextDisabled("No controller connected");
-        return;
-    }
-
-    if (ImGui::BeginMenu("Assign connected controller")) {
-        for (uint32_t index = 0; index < controllerCount; ++index) {
-            const char* name = PADGetNameForControllerIndex(index);
-            ImGui::PushID(static_cast<int>(index));
-            if (ImGui::MenuItem(name != nullptr ? name : "Unknown controller")) {
-                PADSetPortForIndex(index, selectedGamePort);
-                g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
-                ApplyConfiguredMappings();
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndMenu();
-    }
-
+void DrawGamepadMapping(uint32_t port) {
     uint32_t mappingCount = 0;
-    PADButtonMapping* mappings = PADGetButtonMappings(static_cast<uint32_t>(g_controllerPort), &mappingCount);
+    PADButtonMapping* mappings = PADGetButtonMappings(port, &mappingCount);
     if (mappings == nullptr || mappingCount != PAD_BUTTON_COUNT) {
-        ImGui::TextDisabled("Assign a controller to edit its buttons");
         return;
     }
 
     uint32_t altMappingCount = 0;
-    PADButtonMapping* altMappings =
-        PADGetAltButtonMappings(static_cast<uint32_t>(g_controllerPort), &altMappingCount);
+    PADButtonMapping* altMappings = PADGetAltButtonMappings(port, &altMappingCount);
 
     const auto writeBinding = [](size_t index, uint32_t primaryNative, uint32_t altNative) {
         std::string value = NativeBindingConfig(primaryNative);
@@ -811,18 +764,18 @@ void DrawControllerSettings() {
         RuntimeConfigFile::SetControllerButton(index, value);
     };
 
-    // Which rows show the second-binding combo without one being bound yet;
+    // Which rows show the second-binding button without one being bound yet;
     // reset when the user switches ports so a stale "+" click doesn't linger.
     static std::array<bool, PAD_BUTTON_COUNT> altRowExpanded{};
     static int altRowExpandedPort = -1;
-    if (altRowExpandedPort != g_controllerPort) {
-        altRowExpandedPort = g_controllerPort;
+    if (altRowExpandedPort != static_cast<int>(port)) {
+        altRowExpandedPort = static_cast<int>(port);
         altRowExpanded.fill(false);
     }
 
-    ImGui::SeparatorText("Presets");
-    if (ImGui::Button("GameCube")) {
-        const uint32_t port = static_cast<uint32_t>(g_controllerPort);
+    ImGui::TextUnformatted("Layout:");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("GameCube")) {
         PADRestoreDefaultMapping(port);
         uint32_t restoredCount = 0;
         if (PADButtonMapping* restored = PADGetButtonMappings(port, &restoredCount)) {
@@ -840,7 +793,6 @@ void DrawControllerSettings() {
         mappings = PADGetButtonMappings(port, &mappingCount);
     }
     const auto applyPreset = [&](const std::array<const char*, PAD_BUTTON_COUNT>& preset) {
-        const uint32_t port = static_cast<uint32_t>(g_controllerPort);
         for (size_t i = 0; i < kControllerButtons.size(); ++i) {
             if (const NativeButtonItem* native = FindNativeButton(preset[i])) {
                 PADSetButtonMapping(port, PADButtonMapping{native->nativeButton, kControllerButtons[i].padButton});
@@ -853,22 +805,20 @@ void DrawControllerSettings() {
         PADSerializeMappings();
         mappings = PADGetButtonMappings(port, &mappingCount);
     };
-
     ImGui::SameLine();
-    if (ImGui::Button("Classic Controller Pro")) {
+    if (ImGui::SmallButton("Classic Controller Pro")) {
         applyPreset(kClassicProPreset);
     }
     ImGui::SameLine();
-    if (ImGui::Button("PlayStation")) {
+    if (ImGui::SmallButton("PlayStation")) {
         applyPreset(kPlayStationPreset);
     }
 
-    ImGui::SeparatorText("Button mapping");
-    ImGui::TextDisabled("LT / L2 = left trigger. RT / R2 = right trigger.");
-    ImGui::TextDisabled("LB / L1 = left shoulder. RB / R1 = right shoulder.");
-    ImGui::TextDisabled("Click a binding, then press an input. No input for 10 seconds clears it.");
+    ImGui::TextDisabled("Click a binding, then press the input to use. Triggers: LT/L2, RT/R2.");
     const float bindingWidth = ImGui::CalcTextSize("Right shoulder (RB / R1)").x +
                                ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float bindingX = ImGui::GetCursorPosX() + ImGui::CalcTextSize("D-pad Right").x +
+                           ImGui::GetStyle().ItemSpacing.x * 2.0f;
     for (size_t i = 0; i < kControllerButtons.size(); ++i) {
         auto mappingIt = std::find_if(mappings, mappings + mappingCount, [&](const PADButtonMapping& mapping) {
             return mapping.padButton == kControllerButtons[i].padButton;
@@ -898,8 +848,8 @@ void DrawControllerSettings() {
                     PADAxisButtonIdentity(mapping->nativeButton) | (static_cast<uint32_t>(threshold) << 8),
                     mapping->padButton,
                 };
-                if (secondary) PADSetAltButtonMapping(selectedGamePort, updated);
-                else PADSetButtonMapping(selectedGamePort, updated);
+                if (secondary) PADSetAltButtonMapping(port, updated);
+                else PADSetButtonMapping(port, updated);
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 writeBinding(i, mappingIt->nativeButton,
@@ -907,8 +857,10 @@ void DrawControllerSettings() {
                 PADSerializeMappings();
             }
         };
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(kControllerButtons[i].label);
+        ImGui::SameLine(bindingX);
         ImGui::BeginGroup();
-        ImGui::SetNextItemWidth(bindingWidth);
         const std::string primaryCaption = std::string(current.label) + "##primary";
         if (ImGui::Button(primaryCaption.c_str(), ImVec2(bindingWidth, 0.0f))) {
             BeginRebind(RebindKind::Controller, kControllerButtons[i].padButton, kControllerButtons[i].label);
@@ -932,7 +884,6 @@ void DrawControllerSettings() {
                 ImGui::SameLine();
                 ImGui::BeginGroup();
                 const char* altLabel = altBound ? NativeButtonForValue(altIt->nativeButton).label : "None";
-                ImGui::SetNextItemWidth(bindingWidth);
                 const std::string altCaption = std::string(altLabel) + "##alt";
                 if (ImGui::Button(altCaption.c_str(), ImVec2(bindingWidth, 0.0f))) {
                     BeginRebind(RebindKind::Controller, kControllerButtons[i].padButton, kControllerButtons[i].label, true);
@@ -941,11 +892,113 @@ void DrawControllerSettings() {
                 ImGui::EndGroup();
             }
         }
-        ImGui::SameLine();
-        ImGui::TextUnformatted(kControllerButtons[i].label);
         ImGui::PopID();
     }
-    DrawExpressionSettings();
+}
+
+std::string ControllerLabel(uint32_t index) {
+    const char* name = PADGetNameForControllerIndex(index);
+    return name != nullptr ? name : "Unknown controller";
+}
+
+// One row per player: the device combo replaces separate assign/unassign/keyboard controls.
+void DrawPlayerRow(uint32_t port) {
+    const bool keyboard = KeyboardActive(port);
+    const int32_t assigned = PADGetIndexForPort(port);
+    std::string preview = "None";
+    if (keyboard) {
+        preview = "Keyboard and mouse";
+    } else if (assigned >= 0) {
+        preview = ControllerLabel(static_cast<uint32_t>(assigned));
+    } else if (const Wiimote::SlotInfo remote = Wiimote::Slot(port); remote.attached) {
+        preview = WiiRemoteLabel(remote);
+    }
+
+    ImGui::PushID(static_cast<int>(port));
+    const std::string label = "Player " + std::to_string(port + 1);
+    ImGui::AlignTextToFramePadding();
+    if (ImGui::RadioButton(label.c_str(), g_controllerPort == static_cast<int>(port))) {
+        g_controllerPort = static_cast<int>(port);
+    }
+    ImGui::SameLine(ImGui::CalcTextSize("Player 0").x + ImGui::GetFrameHeight() + 16.0f);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##device", preview.c_str())) {
+        g_controllerPort = static_cast<int>(port);
+        if (ImGui::Selectable("None", !keyboard && assigned < 0)) {
+            SetKeyboardActive(port, false);
+            PADClearPort(port);
+            g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
+        }
+        const uint32_t controllerCount = PADCount();
+        for (uint32_t index = 0; index < controllerCount; ++index) {
+            std::string item = ControllerLabel(index);
+            for (uint32_t other = 0; other < PAD_MAX_CONTROLLERS; ++other) {
+                if (other != port && PADGetIndexForPort(other) == static_cast<s32>(index)) {
+                    item += " (Player " + std::to_string(other + 1) + ")";
+                    break;
+                }
+            }
+            ImGui::PushID(static_cast<int>(index));
+            if (ImGui::Selectable(item.c_str(), !keyboard && assigned == static_cast<int32_t>(index))) {
+                SetKeyboardActive(port, false);
+                PADSetPortForIndex(index, port);
+                g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
+                ApplyConfiguredMappings();
+            }
+            ImGui::PopID();
+        }
+        if (ImGui::Selectable("Keyboard and mouse", keyboard)) {
+            SetKeyboardActive(port, true);
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopID();
+}
+
+void DrawControllerSettings() {
+    ImGui::Dummy(ImVec2(kControllerMenuWidth, 0.0f));
+    for (uint32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+        DrawPlayerRow(port);
+    }
+    bool anyRemote = false;
+    for (uint32_t player = 0; player < PAD_MAX_CONTROLLERS; ++player) {
+        anyRemote |= Wiimote::Slot(player).attached;
+    }
+    if (PADCount() == 0 && !anyRemote) {
+        ImGui::TextDisabled("No controller detected. Plug one in, or pair a Wii Remote below.");
+    }
+
+    const uint32_t port = static_cast<uint32_t>(g_controllerPort);
+    ImGui::SeparatorText(("Player " + std::to_string(port + 1)).c_str());
+    const Wiimote::SlotInfo remote = Wiimote::Slot(port);
+    if (remote.attached) {
+        DrawWiiRemoteDetails(port, remote);
+        if (KeyboardActive(port) || PADGetIndexForPort(port) >= 0) {
+            ImGui::Spacing();
+        }
+    }
+    if (KeyboardActive(port)) {
+        DrawKeyboardSettings(port);
+    } else if (PADGetIndexForPort(port) < 0) {
+        if (!remote.attached) {
+            ImGui::TextDisabled("No device. Pick one in the list above.");
+        }
+    } else {
+        ImGui::TextUnformatted("Ready to play.");
+        if (ImGui::CollapsingHeader("Customize buttons")) {
+            ImGui::Indent();
+            DrawGamepadMapping(port);
+            if (ImGui::TreeNode("Advanced: Dolphin expressions")) {
+                DrawExpressionSettings();
+                ImGui::TreePop();
+            }
+            ImGui::Unindent();
+        }
+    }
+
+    ImGui::Spacing();
+    controller_mapping_wizard::DrawSetupList();
+    DrawWiiRemoteSetup();
     DrawRumbleSettings();
 }
 
@@ -1105,6 +1158,7 @@ void DrawGraphicsSettings() {
         ImGui::EndCombo();
     }
     if (frameInterpolationModeChanged) {
+        GX_SYNC_INLINE();
         const uint32_t targetFps = kFrameInterpolationTargetFps[static_cast<size_t>(g_frameInterpolationMode)];
         aurora_set_frame_interpolation_fps(targetFps);
         RuntimeConfigFile::SetFrameInterpolationFps(targetFps);
@@ -1148,12 +1202,18 @@ void DrawGraphicsSettings() {
     }
 #endif
     if (ImGui::Checkbox("Disable copy filter", &g_disableCopyFilter)) {
+        GX_SYNC_INLINE();
         aurora_set_disable_copy_filter(g_disableCopyFilter);
         RuntimeConfigFile::SetDisableCopyFilter(g_disableCopyFilter);
     }
     if (ImGui::Checkbox("Skip draws while shaders compile", &g_skipUnreadyPipelines)) {
+        GX_SYNC_INLINE();
         aurora_set_skip_unready_pipelines(g_skipUnreadyPipelines);
         RuntimeConfigFile::SetSkipUnreadyPipelines(g_skipUnreadyPipelines);
+    }
+    if (ImGui::Checkbox("VSync", &g_vsync)) {
+        aurora_enable_vsync(g_vsync);
+        RuntimeConfigFile::SetVsync(g_vsync);
     }
     if (ImGui::Checkbox("Show FPS", &g_showFps)) {
         RuntimeConfigFile::SetShowFps(g_showFps);
@@ -1168,7 +1228,12 @@ void DrawGraphicsSettings() {
 void DrawFpsOverlay() {
     AuroraPresentTiming presentTiming{};
     aurora_get_present_timing(&presentTiming);
-    if (!g_showFps) {
+    const uint32_t targetFps = kFrameInterpolationTargetFps[static_cast<size_t>(g_frameInterpolationMode)];
+    const double refreshRate = aurora_get_display_refresh_rate();
+    const bool interpolationInactive = targetFps > 60 && !aurora_display_shows_interpolation();
+    const bool unevenPacing =
+        !g_vsync && !interpolationInactive && refreshRate > 0.0 && targetFps > refreshRate + 1.0;
+    if (!g_showFps && !unevenPacing && !interpolationInactive) {
         return;
     }
 
@@ -1185,9 +1250,9 @@ void DrawFpsOverlay() {
                                          ImGuiWindowFlags_NoNav |
                                          ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("FPS Overlay", nullptr, kFlags)) {
-        if (presentTiming.sampleCount == 0) {
+        if (g_showFps && presentTiming.sampleCount == 0) {
             ImGui::TextUnformatted("FPS: --");
-        } else {
+        } else if (g_showFps) {
             // Present timing includes the additional frames produced by
             // interpolation, so this remains the actual displayed FPS.
             ImGui::Text("FPS: %.1f", presentTiming.framesPerSecond);
@@ -1199,6 +1264,17 @@ void DrawFpsOverlay() {
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Motion: %.1f",
                                    presentTiming.effectiveFramesPerSecond);
             }
+        }
+        if (interpolationInactive) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                               "%u FPS interpolation has no effect on a %.0f Hz display.", targetFps,
+                               refreshRate);
+        }
+        if (unevenPacing) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                               "%u FPS interpolation on a %.0f Hz display without VSync is not smooth.\n"
+                               "Enable VSync for smooth motion.",
+                               targetFps, refreshRate);
         }
     }
     ImGui::End();
@@ -1256,6 +1332,7 @@ void DrawStartupScreen() {
         const float startY = std::max(0.0f, (viewport->Size.y - titleSize.y) * 0.5f);
         ImGui::SetCursorPos(ImVec2(titleX, startY));
         ImGui::TextUnformatted(kTitle);
+        float nextY = startY + titleSize.y + 12.0f;
         if (g_bootShaderNotice && !g_bootShadersReady.load(std::memory_order_relaxed)) {
             ImGui::SetWindowFontScale(0.9f);
             char line[96];
@@ -1264,7 +1341,13 @@ void DrawStartupScreen() {
             const float lineX = std::max(0.0f, (viewport->Size.x - ImGui::CalcTextSize(line).x) * 0.5f);
             ImGui::SetCursorPos(ImVec2(lineX, startY + titleSize.y * 1.8f));
             ImGui::TextUnformatted(line);
+            nextY = ImGui::GetCursorPosY() + 4.0f;
         }
+        constexpr const char* kHint = "Press F10 to open settings";
+        ImGui::SetWindowFontScale(0.8f);
+        const ImVec2 hintSize = ImGui::CalcTextSize(kHint);
+        ImGui::SetCursorPos(ImVec2(std::max(0.0f, (viewport->Size.x - hintSize.x) * 0.5f), nextY));
+        ImGui::TextUnformatted(kHint);
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -1295,6 +1378,19 @@ void DrawExitPrompt() {
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) g_exitPromptOpen = false;
     if (!g_exitPromptOpen) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void DrawRestartPrompt() {
+    constexpr const char* kTitle = "Restart required";
+    if (g_restartPromptOpen && !ImGui::IsPopupOpen(kTitle)) ImGui::OpenPopup(kTitle);
+    if (!ImGui::BeginPopupModal(kTitle, &g_restartPromptOpen, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    ImGui::TextUnformatted(g_wiiRemotesEnabled ? "Wii Remotes will be used after you restart the game."
+                                               : "Wii Remotes will stop being used after you restart the game.");
+    if (ImGui::Button("Exit now", ImVec2(140.0f, 0.0f))) ExitForAuroraWindowClose();
+    ImGui::SameLine();
+    if (ImGui::Button("Restart later", ImVec2(140.0f, 0.0f))) g_restartPromptOpen = false;
+    if (!g_restartPromptOpen) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
 
@@ -1351,6 +1447,7 @@ void DrawTopBar() {
         ImGui::EndMenu();
     }
 
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, viewport->Size.y * 0.75f));
     if (ImGui::BeginMenu("Controller settings")) {
         DrawControllerSettings();
         // Nest capture under this menu so opening/closing the modal preserves
@@ -1435,7 +1532,7 @@ void PersistDisplayModeIfChanged() {
 
 void ApplyInputBlockState() {
     const bool blocked = controller_mapping_wizard::IsActive() || g_rebind.active ||
-                         g_exitPromptOpen || g_topBarVisible || StartupScreenVisible();
+                         g_exitPromptOpen || g_restartPromptOpen || g_topBarVisible || StartupScreenVisible();
     PADBlockInput(blocked);
     InputBindings::SetInputBlocked(blocked);
 }
@@ -1501,7 +1598,9 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             RuntimeConfigFile::SetAudioMuted(g_audioMuted);
         }
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_ESCAPE)) {
-            if (g_exitPromptOpen) {
+            if (g_restartPromptOpen) {
+                g_restartPromptOpen = false;
+            } else if (g_exitPromptOpen) {
                 g_exitPromptOpen = false;
             } else if (g_topBarVisible) {
                 SetTopBarVisible(false);
@@ -1531,6 +1630,7 @@ void ReleaseControllers() noexcept {
     constexpr std::array<uint32_t, PAD_MAX_CONTROLLERS> stopAll{
         PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD, PAD_MOTOR_STOP_HARD};
     PADControlAllMotors(stopAll.data());
+    Wiimote::Shutdown();
     // SDL hands LED and rumble reports to its own HIDAPI sender thread rather
     // than writing them here, so without this the process dies before the
     // controller ever receives them.
@@ -1538,14 +1638,7 @@ void ReleaseControllers() noexcept {
 }
 
 void Draw() noexcept {
-    // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
-    // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
-    aurora_wait_for_frame_worker();
-    // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
-    // runs once per presented frame whatever the game is doing (e.g. sitting in
-    // its "communications interrupted" prompt without polling pads). Same guest
-    // thread as PADRead, so no concurrent access to the scanner's state.
-    WiiRemoteInput::Poll();
+    // ImGui is only touched on this thread; the render worker replays a frozen copy.
     ApplyConfiguredMappings();
     PersistDisplayModeIfChanged();
     UpdateCursorAutoHide();
@@ -1556,6 +1649,7 @@ void Draw() noexcept {
     DrawFpsOverlay();
     DrawTopBar();
     DrawExitPrompt();
+    DrawRestartPrompt();
     controller_mapping_wizard::Draw();
     ApplyInputBlockState();
     DrawStartupScreen();

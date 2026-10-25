@@ -45,6 +45,8 @@ struct RuntimeUserConfig {
     std::optional<uint32_t> frameInterpolationFps;
     std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
+    std::optional<bool> vsync;
+    std::optional<bool> gxWorker;
     std::optional<bool> disableCopyFilter;
     std::optional<bool> textureReplacements;
     std::optional<bool> textureDumps;
@@ -58,25 +60,16 @@ struct RuntimeUserConfig {
     std::optional<bool> audioMuted;
     std::optional<bool> audioMixWorker;
     std::optional<bool> attenuateMusicWhenMediaPlays;
-    // Real Wii Remotes (with or without Nunchuk / Classic Controller) and Wii U Pro
-    // Controllers paired over Bluetooth, driven by SDL's HIDAPI Wii driver. The driver
-    // is opt-in on SDL's side, so this decides whether the runtime turns it on.
+    // Real Wii Remotes passed through to the game's own Bluetooth stack. Off hands
+    // Nintendo controllers (e.g. the Wii U Pro Controller) to SDL as plain gamepads.
     std::optional<bool> wiiRemotes;
-    // Keep re-enumerating Bluetooth HID devices while no Wii controller is connected
-    // (Dolphin's "continuous scanning"), so a remote that dropped or was switched on
-    // after launch shows up without restarting.
-    std::optional<bool> wiiContinuousScan;
-    // Accelerometer zero-point correction for the Bluetooth Wii Remote, in g and in
-    // SDL's sensor frame (x right, y out of the button face, z towards the user).
-    // SDL's Wii driver falls back to a nominal zero point when its read of the
-    // remote's calibration block times out (common over Bluetooth), so this is
-    // measured in the overlay with the remote at rest.
-    std::optional<double> wiiAccelOffsetX;
-    std::optional<double> wiiAccelOffsetY;
-    std::optional<double> wiiAccelOffsetZ;
-    // Debugging aid: append every KPAD sample of the Bluetooth remote (raw and
-    // corrected accelerometer, buttons) to wii_accel_trace.csv next to Config.toml.
-    std::optional<bool> wiiAccelTrace;
+    // Look for remotes in pairing mode (1+2 / SYNC) while none is connected.
+    std::optional<bool> wiiAutoPair;
+    // The console's Wii Remote settings (SYSCONF BT.BAR, BT.SENS, BT.SPKV, BT.MOT).
+    std::optional<bool> wiiSensorBarAbove;
+    std::optional<int32_t> wiiIrSensitivity;
+    std::optional<int32_t> wiiSpeakerVolume;
+    std::optional<bool> wiiRumble;
     std::optional<bool> networkEnabled;
     std::optional<bool> discordPresenceEnabled;
     // The application ID of the WiiCompiled Discord application. This is only
@@ -137,28 +130,6 @@ inline std::string Trim(std::string_view text) {
         --end;
     }
     return std::string(text.substr(begin, end - begin));
-}
-
-inline std::string RemoveComment(std::string_view line) {
-    bool inSingle = false;
-    bool inDouble = false;
-    bool escaped = false;
-    for (size_t i = 0; i < line.size(); ++i) {
-        const char ch = line[i];
-        if (inDouble && ch == '\\' && !escaped) {
-            escaped = true;
-            continue;
-        }
-        if (ch == '\'' && !inDouble) {
-            inSingle = !inSingle;
-        } else if (ch == '"' && !inSingle && !escaped) {
-            inDouble = !inDouble;
-        } else if (ch == '#' && !inSingle && !inDouble) {
-            return std::string(line.substr(0, i));
-        }
-        escaped = false;
-    }
-    return std::string(line);
 }
 
 inline bool IsSupportedResolutionMultiplier(float value) {
@@ -317,6 +288,9 @@ inline void EnsureConfigFile() {
               "display_mode = \"windowed\"\n"
               "graphics_api = \"auto\"\n"
               "skip_unready_pipelines = true\n"
+              "vsync = false\n"
+              "# Runs GX command processing on its own thread. Read once, at startup.\n"
+              "gx_worker = true\n"
               "disable_copy_filter = true\n"
               "show_fps = true\n"
               "# Dolphin-style custom textures. When enabled, the renderer indexes\n"
@@ -474,6 +448,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.metalFxSpatialUpscaling =
         FindConfigValue<bool>(document, "video", "metalfx_spatial_upscaling");
     config.skipUnreadyPipelines = FindConfigValue<bool>(document, "video", "skip_unready_pipelines");
+    config.vsync = FindConfigValue<bool>(document, "video", "vsync");
+    config.gxWorker = FindConfigValue<bool>(document, "video", "gx_worker");
     config.disableCopyFilter = FindConfigValue<bool>(document, "video", "disable_copy_filter");
     config.showFps = FindConfigValue<bool>(document, "video", "show_fps");
     config.textureReplacements = FindConfigValue<bool>(document, "video", "texture_replacements");
@@ -497,11 +473,17 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.attenuateMusicWhenMediaPlays =
         FindConfigValue<bool>(document, "audio", "attenuate_music_when_media_plays");
     config.wiiRemotes = FindConfigValue<bool>(document, "controller", "wii_remotes");
-    config.wiiContinuousScan = FindConfigValue<bool>(document, "controller", "wii_continuous_scan");
-    config.wiiAccelOffsetX = FindConfigValue<double>(document, "controller", "wii_accel_offset_x");
-    config.wiiAccelOffsetY = FindConfigValue<double>(document, "controller", "wii_accel_offset_y");
-    config.wiiAccelOffsetZ = FindConfigValue<double>(document, "controller", "wii_accel_offset_z");
-    config.wiiAccelTrace = FindConfigValue<bool>(document, "controller", "wii_accel_trace");
+    config.wiiAutoPair = FindConfigValue<bool>(document, "controller", "wii_auto_pair");
+    if (const auto bar = FindConfigValue<std::string>(document, "controller", "wii_sensor_bar")) {
+        if (*bar == "above" || *bar == "below") config.wiiSensorBarAbove = *bar == "above";
+    }
+    if (const auto value = FindConfigInt(document, "controller", "wii_ir_sensitivity"); value && *value >= 1 && *value <= 5) {
+        config.wiiIrSensitivity = *value;
+    }
+    if (const auto value = FindConfigInt(document, "controller", "wii_speaker_volume"); value && *value >= 0 && *value <= 127) {
+        config.wiiSpeakerVolume = *value;
+    }
+    config.wiiRumble = FindConfigValue<bool>(document, "controller", "wii_rumble");
     config.networkEnabled = FindConfigValue<bool>(document, "network", "enabled");
     config.discordPresenceEnabled = FindConfigValue<bool>(document, "discord", "enabled");
     config.discordClientId = FindConfigValue<std::string>(document, "discord", "client_id");
@@ -557,68 +539,50 @@ inline const std::optional<std::string>& ControllerButton(size_t index) {
     return index < Get().controllerButtons.size() ? Get().controllerButtons[index] : empty;
 }
 
-// Update one TOML value without discarding comments, unrelated settings, or
-// user-specific paths. This is used by the in-game F10 settings bar.
+// Sets section.key (section may be a dotted table path) to a TOML literal, keeping the rest of the
+// document's keys, order and comments. Returns nullopt when the document or value does not parse.
+inline std::optional<std::string> UpdateSettingText(const std::string& text, std::string_view section,
+                                                    std::string_view key, std::string_view value) {
+    try {
+        auto root = toml::parse_str<toml::ordered_type_config>(text);
+        auto literal = toml::parse_str<toml::ordered_type_config>("v = " + std::string(value));
+        auto* table = &root;
+        std::istringstream path{std::string(section)};
+        for (std::string part; std::getline(path, part, '.');) {
+            auto& parent = table->as_table();
+            if (!parent.contains(part)) {
+                parent[part] = toml::ordered_value(toml::ordered_table{});
+            }
+            table = &parent.at(part);
+            if (!table->is_table()) {
+                return std::nullopt;
+            }
+        }
+        if (table->as_table_fmt().fmt == toml::table_format::implicit) {
+            table->as_table_fmt().fmt = toml::table_format::multiline;
+        }
+        auto& slot = table->as_table()[std::string(key)];
+        auto& updated = literal.as_table().at("v");
+        updated.comments() = slot.comments();
+        slot = std::move(updated);
+        return toml::format(root);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+// Update one TOML value without discarding unrelated settings or user-specific paths. This is
+// used by the in-game F10 settings bar. An unparseable file is left untouched.
 inline bool WriteSetting(std::string_view section, std::string_view key, std::string_view value) {
     const auto path = ResolveConfigPath();
-    std::ifstream input(path);
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        lines.push_back(std::move(line));
+    std::ostringstream existing;
+    if (std::ifstream input(path, std::ios::binary); input) {
+        existing << input.rdbuf();
     }
-
-    const std::string normalizedSection = Trim(section);
-    const std::string normalizedKey = Trim(key);
-    size_t sectionStart = lines.size();
-    size_t sectionEnd = lines.size();
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string trimmed = Trim(RemoveComment(lines[i]));
-        if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
-            const std::string found = Trim(std::string_view(trimmed).substr(1, trimmed.size() - 2));
-            if (sectionStart != lines.size()) {
-                sectionEnd = i;
-                break;
-            }
-            if (found == normalizedSection) {
-                sectionStart = i;
-            }
-        }
-    }
-
-    const std::string replacement = normalizedKey + " = " + std::string(value);
-    if (sectionStart == lines.size()) {
-        if (!lines.empty() && !lines.back().empty()) {
-            lines.emplace_back();
-        }
-        lines.emplace_back("[" + normalizedSection + "]");
-        lines.push_back(replacement);
-    } else {
-        bool replaced = false;
-        for (size_t i = sectionStart + 1; i < sectionEnd; ++i) {
-            const std::string uncommented = Trim(RemoveComment(lines[i]));
-            const size_t equals = uncommented.find('=');
-            if (equals != std::string::npos && Trim(std::string_view(uncommented).substr(0, equals)) == normalizedKey) {
-                lines[i] = replacement;
-                replaced = true;
-                break;
-            }
-        }
-        if (!replaced) {
-            // Append after the section's last real line rather than after the blank line that
-            // separates it from the next header: this file is edited by hand and by the host
-            // installer as well, and a key parked below the separator reads as if it belonged to
-            // the next section. The host writer (Launcher/WiiCompiled.Setup/RuntimeConfiguration.cs)
-            // applies exactly this rule.
-            size_t insertAt = sectionEnd;
-            while (insertAt > sectionStart + 1 && Trim(lines[insertAt - 1]).empty()) {
-                --insertAt;
-            }
-            lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertAt), replacement);
-        }
+    const auto updated = UpdateSettingText(existing.str(), section, key, value);
+    if (!updated) {
+        std::cerr << "[runtime-config] Not updating invalid " << PathToUtf8(path) << std::endl;
+        return false;
     }
 
     std::error_code ec;
@@ -630,9 +594,7 @@ inline bool WriteSetting(std::string_view section, std::string_view key, std::st
         std::cerr << "[runtime-config] Unable to write " << PathToUtf8(path) << std::endl;
         return false;
     }
-    for (const auto& outputLine : lines) {
-        output << outputLine << '\n';
-    }
+    output << *updated;
     return static_cast<bool>(output);
 }
 
@@ -691,6 +653,11 @@ inline bool SetDisplayMode(std::string value) {
 inline bool SetSkipUnreadyPipelines(bool value) {
     Mutable().skipUnreadyPipelines = value;
     return WriteSetting("video", "skip_unready_pipelines", value ? "true" : "false");
+}
+
+inline bool SetVsync(bool value) {
+    Mutable().vsync = value;
+    return WriteSetting("video", "vsync", value ? "true" : "false");
 }
 
 inline bool SetDisableCopyFilter(bool value) {
@@ -868,67 +835,71 @@ inline bool AudioMixWorkerEnabled(bool fallback = true) {
     return Get().audioMixWorker.value_or(fallback);
 }
 
+inline bool GxWorkerEnabled(bool fallback = true) {
+    return Get().gxWorker.value_or(fallback);
+}
+
 // Whether background music should duck automatically for other media playback.
 inline bool AttenuateMusicWhenMediaPlays(bool fallback = false) {
     return Get().attenuateMusicWhenMediaPlays.value_or(fallback);
 }
 
-// Bluetooth Wii Remotes / Wii U Pro Controllers. Read once before SDL's joystick
-// subsystem comes up, so a change only takes effect on the next launch.
-inline bool WiiRemotesEnabled(bool fallback = true) {
+// Bluetooth Wii Remotes. Read once before SDL's joystick subsystem comes up, so a
+// change only takes effect on the next launch.
+inline bool WiiRemotesEnabled(bool fallback = false) {
     return Get().wiiRemotes.value_or(fallback);
 }
 
-// Persists the Bluetooth Wii Remote driver switch.
 inline bool SetWiiRemotesEnabled(bool value) {
+    if (!WriteSetting("controller", "wii_remotes", value ? "true" : "false")) return false;
     Mutable().wiiRemotes = value;
-    return WriteSetting("controller", "wii_remotes", value ? "true" : "false");
+    return true;
 }
 
-// Whether to keep rescanning Bluetooth while no Wii controller is connected.
-inline bool WiiContinuousScanEnabled(bool fallback = false) {
-    return Get().wiiContinuousScan.value_or(fallback);
+inline bool WiiAutoPairEnabled(bool fallback = true) {
+    return Get().wiiAutoPair.value_or(fallback);
 }
 
-// Persists the continuous scanning switch.
-inline bool SetWiiContinuousScanEnabled(bool value) {
-    Mutable().wiiContinuousScan = value;
-    return WriteSetting("controller", "wii_continuous_scan", value ? "true" : "false");
+inline bool SetWiiAutoPairEnabled(bool value) {
+    Mutable().wiiAutoPair = value;
+    return WriteSetting("controller", "wii_auto_pair", value ? "true" : "false");
 }
 
-// Wii Remote accelerometer zero-point correction (g, SDL sensor frame); all zero
-// when the remote has not been calibrated.
-inline std::array<double, 3> WiiAccelOffset() {
-    const RuntimeUserConfig& config = Get();
-    return {config.wiiAccelOffsetX.value_or(0.0), config.wiiAccelOffsetY.value_or(0.0),
-            config.wiiAccelOffsetZ.value_or(0.0)};
+// Defaults are the console's.
+inline bool WiiSensorBarAbove(bool fallback = false) {
+    return Get().wiiSensorBarAbove.value_or(fallback);
 }
 
-// Whether to write the per-frame accelerometer trace (off unless asked for).
-inline bool WiiAccelTraceEnabled(bool fallback = false) {
-    return Get().wiiAccelTrace.value_or(fallback);
+inline bool SetWiiSensorBarAbove(bool value) {
+    Mutable().wiiSensorBarAbove = value;
+    return WriteSetting("controller", "wii_sensor_bar", value ? "\"above\"" : "\"below\"");
 }
 
-// True while a non-zero correction is stored ("Clear calibration" writes zeros).
-inline bool HasWiiAccelOffset() {
-    const std::array<double, 3> offset = WiiAccelOffset();
-    return offset[0] != 0.0 || offset[1] != 0.0 || offset[2] != 0.0;
+inline int32_t WiiIrSensitivity(int32_t fallback = 3) {
+    return Get().wiiIrSensitivity.value_or(fallback);
 }
 
-// Persists the accelerometer correction measured by the overlay's calibration.
-inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
-    Mutable().wiiAccelOffsetX = offset[0];
-    Mutable().wiiAccelOffsetY = offset[1];
-    Mutable().wiiAccelOffsetZ = offset[2];
-    bool ok = true;
-    const char* keys[3] = {"wii_accel_offset_x", "wii_accel_offset_y", "wii_accel_offset_z"};
-    for (size_t i = 0; i < 3; ++i) {
-        // Always a float literal, so a whole-number offset does not come back as a TOML integer.
-        std::ostringstream formatted;
-        formatted << std::fixed << std::setprecision(4) << offset[i];
-        ok = WriteSetting("controller", keys[i], formatted.str()) && ok;
-    }
-    return ok;
+inline bool SetWiiIrSensitivity(int32_t value) {
+    Mutable().wiiIrSensitivity = value;
+    return WriteSetting("controller", "wii_ir_sensitivity", std::to_string(value));
+}
+
+inline int32_t WiiSpeakerVolume(int32_t fallback = 0x59) {
+    return Get().wiiSpeakerVolume.value_or(fallback);
+}
+
+inline bool SetWiiSpeakerVolume(int32_t value) {
+    Mutable().wiiSpeakerVolume = value;
+    return WriteSetting("controller", "wii_speaker_volume", std::to_string(value));
+}
+
+inline bool WiiRumbleEnabled(bool fallback = true) {
+    return Get().wiiRumble.value_or(fallback);
+}
+
+inline bool SetWiiRumbleEnabled(bool value) {
+    Mutable().wiiRumble = value;
+    return WriteSetting("controller", "wii_rumble", value ? "true" : "false");
 }
 
 // Target frame rate for frame interpolation, or 0 to disable it.
@@ -939,6 +910,10 @@ inline uint32_t FrameInterpolationFps(uint32_t fallback = 0) {
 // Whether to skip draws whose graphics pipeline has not finished compiling yet.
 inline bool SkipUnreadyPipelines(bool fallback = true) {
     return Get().skipUnreadyPipelines.value_or(fallback);
+}
+
+inline bool Vsync(bool fallback = false) {
+    return Get().vsync.value_or(fallback);
 }
 
 inline bool DisableCopyFilter(bool fallback = true) {
@@ -1052,6 +1027,9 @@ inline void LogLoadedConfig() {
             }
             if (config.skipUnreadyPipelines) {
                 std::cout << " skip_unready_pipelines=" << (*config.skipUnreadyPipelines ? "true" : "false");
+            }
+            if (config.vsync) {
+                std::cout << " vsync=" << (*config.vsync ? "true" : "false");
             }
             if (config.disableCopyFilter) {
                 std::cout << " disable_copy_filter=" << (*config.disableCopyFilter ? "true" : "false");

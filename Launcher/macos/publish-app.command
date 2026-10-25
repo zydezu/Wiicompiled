@@ -37,6 +37,10 @@ for tool in codesign ditto install_name_tool lipo otool; do command -v "$tool" >
 lipo "$build_dir/$product" -verify_arch "$architecture" || fail "compiled product is not $architecture: $build_dir/$product"
 for asset in dsp_coef.bin initial_pipeline_cache.db cacert.pem wii_bootstrap; do [[ -e "$build_dir/$asset" ]] || fail "missing runtime asset: $build_dir/$asset"; done
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+icon="$script_dir/../../runtime/resources/$product.icns"
+[[ -f "$icon" ]] || fail "missing app icon: $icon"
+
 app="$output_dir/$product.app"
 macos="$app/Contents/MacOS"
 frameworks="$app/Contents/Frameworks"
@@ -51,6 +55,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleExecutable</key><string>$product</string>
   <key>CFBundleIdentifier</key><string>org.wiicompiled.$product</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleIconFile</key><string>$product.icns</string>
   <key>CFBundleName</key><string>$product</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -59,6 +64,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 EOF
+ditto "$icon" "$resources/$product.icns"
 ditto "$build_dir/$product" "$macos/$product"
 for asset in dsp_coef.bin initial_pipeline_cache.db cacert.pem wii_bootstrap; do
     ditto "$build_dir/$asset" "$resources/$asset"

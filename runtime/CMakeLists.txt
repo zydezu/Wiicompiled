@@ -42,6 +42,12 @@ else()
         "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64")
 endif()
 
+if(MKW_PLATFORM_WINDOWS)
+    # CMake and Ninja write response files with Windows quoting, but clang tokenizes them with
+    # POSIX rules by default, where a bare apostrophe in a path opens a quoted span.
+    add_link_options(--rsp-quoting=windows)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
 endif()
@@ -55,6 +61,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$" AND
    NOT MKW_X86_CPU_PROFILE MATCHES "^(v2|v3)$")
     message(FATAL_ERROR "MKW_X86_CPU_PROFILE must be v2 or v3 (got '${MKW_X86_CPU_PROFILE}')")
 endif()
+
+set(MKW_SETUP_VERSION "" CACHE STRING "WiiCompiled version recorded in the runtime log")
 
 option(MKW_PLATFORM_TESTS_ONLY "Build host-platform tests without graphics dependencies or game assets" OFF)
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/HostLibraries.cmake")
@@ -86,6 +94,8 @@ set(MKW_NATIVE_PREBUILT_DIR "" CACHE PATH
 # package can be harvested from it.
 set(MKW_NATIVE_PREBUILT_EXPORT_DIR "" CACHE PATH
     "Maintainer-only: write a description of the configured aurora build here")
+option(MKW_USE_PREBUILT_RUNTIME
+    "Link the native prebuilt package's runtime archive when it matches this workspace" ON)
 
 # The two Crypto++ configuration macros are load-bearing for ABI: they shape the
 # structs and inline code the headers generate, so a first-party TU including
@@ -186,7 +196,14 @@ set(MKW_CPPWINRT_INCLUDE_DIR "" CACHE PATH "Optional self-contained C++/WinRT in
 # not compiled at all; imported targets with the same names are wired up from
 # the package instead, so this project's own code compiles and links exactly
 # as before.
-set(MKW_AURORA_DIR "${CMAKE_CURRENT_LIST_DIR}/../aurora-main")
+set(MKW_AURORA_DIR "${CMAKE_CURRENT_LIST_DIR}/../aurora-main" CACHE PATH
+    "Aurora source directory")
+if(NOT EXISTS "${MKW_AURORA_DIR}/CMakeLists.txt"
+        OR NOT EXISTS "${MKW_AURORA_DIR}/include/aurora/aurora.h")
+    message(FATAL_ERROR
+        "Aurora sources are missing at ${MKW_AURORA_DIR}. From the repository root, run "
+        "git submodule update --init --recursive, or set MKW_AURORA_DIR to an initialized Aurora checkout.")
+endif()
 
 # The translator's explicit float casts are PPC single-precision rounding points.
 # Fast-math may erase them and change guest-visible integer conversions.
@@ -213,9 +230,6 @@ if(MKW_NATIVE_PREBUILT_DIR)
     # not compiled here.
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/NativePrebuilt.cmake")
 else()
-    if(NOT EXISTS ${MKW_AURORA_DIR}/CMakeLists.txt)
-        message(FATAL_ERROR "Requested aurora-main but ${MKW_AURORA_DIR} is missing")
-    endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
     if(MKW_PLATFORM_WINDOWS)
         set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
@@ -261,6 +275,19 @@ else()
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
 
+    # Aurora components the runtime does not use. They would otherwise fetch
+    # extra dependencies at configure time, which offline builds cannot do.
+    set(AURORA_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_DVD OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_THP OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_RMLUI OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_CARD OFF CACHE BOOL "" FORCE)
+    # The runtime implements the Wii SDK itself; Aurora stays on its GameCube SDK.
+    set(AURORA_TARGET_RVL OFF CACHE BOOL "" FORCE)
+    # Every dependency comes from the pinned sources, never the build host.
+    set(AURORA_USE_SYSTEM_DEPENDENCIES OFF CACHE BOOL "" FORCE)
+
     # MinGW/WSL can choke on SDL precompiled headers; disable PCH for aurora/SDL.
     set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
     # Isolate aurora build products to a subdirectory under the main build dir.
@@ -297,20 +324,16 @@ else()
             TARGET_DIRECTORY aurora_gx
             PROPERTIES COMPILE_OPTIONS "-fno-finite-math-only")
     endif()
-
-    if(MKW_NATIVE_PREBUILT_EXPORT_DIR)
-        include("${CMAKE_CURRENT_LIST_DIR}/cmake/NativePrebuiltExport.cmake")
-    endif()
 endif()
 
 # Everything from here down is this project's own code, so this is where the
 # project definitions enter the directory scope. A directory-scoped definition
 # seeds the COMPILE_DEFINITIONS of targets as they are created, which means:
 #   * aurora-main and its third-party tree were added above -> unaffected;
-#   * mkw_runtime_common, the translated shard libraries and the products in
-#     cmake/PublicProducts.cmake are all created below (that file is include()d,
-#     not add_subdirectory()d, so it shares this directory scope) -> they pick
-#     the definitions up exactly as before.
+#   * the runtime library, the translated shard libraries and the products in
+#     cmake/RuntimeLibrary.cmake and cmake/PublicProducts.cmake are all created
+#     below (those files are include()d, not add_subdirectory()d, so they share
+#     this directory scope) -> they pick the definitions up exactly as before.
 if(MKW_PROJECT_COMPILE_DEFINITIONS)
     add_compile_definitions(${MKW_PROJECT_COMPILE_DEFINITIONS})
 endif()
@@ -339,12 +362,26 @@ set(MKW_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.
 set(MKW_RETRO_REWIND_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/retro_rewind_product.cpp")
 # The host ISA guard is the one translation unit that must not receive the
 # x86-64-v3 flags, so it gets its own object library instead of riding along in
-# mkw_runtime_common. See cmake/PublicProducts.cmake and the file's own header.
+# the runtime library. See cmake/PublicProducts.cmake and the file's own header.
 set(MKW_CPU_BASELINE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/host_cpu_baseline.cpp")
 list(REMOVE_ITEM SOURCES ${MKW_BASE_PRODUCT_SOURCE} ${MKW_RETRO_REWIND_PRODUCT_SOURCE}
      ${MKW_CPU_BASELINE_SOURCE} ${MKW_PLATFORM_SOURCE})
 
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/PlatformTests.cmake")
+
+set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/RuntimeLibrary.cmake")
+
+# The prebuilt export also carries the game-independent runtime as a static
+# archive (x86_64 only; AArch64 compiles it locally with -mcpu=native). It is
+# defined here, after the project definitions, so its flags match the products'.
+if(MKW_NATIVE_PREBUILT_EXPORT_DIR AND NOT MKW_NATIVE_PREBUILT_DIR)
+    if(MKW_HOST_IS_X86_64)
+        mkw_add_runtime_library(mkw_runtime STATIC ${SOURCES})
+        set_target_properties(mkw_runtime PROPERTIES EXCLUDE_FROM_ALL ON)
+    endif()
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/NativePrebuiltExport.cmake")
+endif()
 
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
@@ -353,8 +390,8 @@ if(MKW_BUILD_PRODUCTS)
     set(MKW_TRANSLATED_SHARD_MANIFEST
         "${CMAKE_CURRENT_LIST_DIR}/../generated/build_shards/shards.cmake"
         CACHE FILEPATH "Translator-owned aggregate shard manifest")
-    # The prebuilt export only needs the aurora/third-party closure configured above, so a
-    # packaging machine without a translation stops here instead of failing.
+    # The prebuilt export only needs the aurora/third-party closure and the runtime
+    # configured above, so a packaging machine without a translation stops here.
     if(MKW_NATIVE_PREBUILT_EXPORT_DIR AND NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
         message(STATUS "No translator shard manifest; configuring the native prebuilt export only")
         return()
@@ -371,23 +408,16 @@ if(MKW_BUILD_PRODUCTS)
         "${MKW_PROFILE_SENSITIVE_CALLER_COUNT} profile-sensitive callers; "
         "${MKW_RETRO_REWIND_FUNCTION_COUNT} Retro Rewind functions")
 
-    set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
 else()
     if(MKW_PLATFORM_MACOS)
         # Compile-only audit of native runtime sources. It deliberately avoids
         # translated products until their host dependencies are portable.
-        # These sources depend on generated/RuntimeConfig.h, which is emitted for
-        # a particular game by the translator and is intentionally unavailable
-        # in this platform-only configuration.
-        set(MKW_MACOS_NATIVE_AUDIT_SOURCES ${SOURCES})
-        list(REMOVE_ITEM MKW_MACOS_NATIVE_AUDIT_SOURCES
-            "${CMAKE_CURRENT_LIST_DIR}/src/abi_bridge.cpp"
-            "${CMAKE_CURRENT_LIST_DIR}/src/hle/os/os_alarm.cpp")
-        add_library(mkw_macos_native_compile OBJECT ${MKW_MACOS_NATIVE_AUDIT_SOURCES})
+        # runtime/src is game-independent; per-game glue lives in runtime/game.
+        add_library(mkw_macos_native_compile OBJECT ${SOURCES})
         target_include_directories(mkw_macos_native_compile PRIVATE
             "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src"
-            "${CMAKE_CURRENT_LIST_DIR}/.." "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
+            "${CMAKE_CURRENT_LIST_DIR}/.." "${MKW_AURORA_DIR}/include")
         target_compile_features(mkw_macos_native_compile PRIVATE cxx_std_20)
         target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
         target_link_libraries(mkw_macos_native_compile PRIVATE

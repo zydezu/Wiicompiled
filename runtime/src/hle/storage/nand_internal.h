@@ -10,6 +10,7 @@
 #include "memory.h"
 #include "nand_path.h"
 #include "nand_save_probe.h"
+#include "hle/bluetooth_hle.h"
 #include "hle/net/network.h"
 #include "recomp_mod_loader.h"
 #include "runtime_config.h"
@@ -44,7 +45,7 @@
 // Mario Kart Wii Title ID
 namespace {
 constexpr uint32_t kNandTitleIdHi = 0x00010004;
-constexpr uint32_t kNandTitleIdLo = 0x524D4350; // "RMCP" fallback
+inline uint32_t NandTitleIdLo() { return ::GuestRegion::CurrentFacts().gameCode; }
 } // anonymous namespace
 
 // ============================================================================
