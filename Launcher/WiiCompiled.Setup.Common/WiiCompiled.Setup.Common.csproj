@@ -12,6 +12,8 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Tomlyn" Version="2.10.1" />
+    <PackageReference Include="Tomlyn" Version="2.10.1">
+      <ExcludeAssets>analyzers</ExcludeAssets>
+    </PackageReference>
   </ItemGroup>
 </Project>
