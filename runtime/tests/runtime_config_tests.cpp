@@ -51,6 +51,20 @@ int main() {
         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "invalid.toml");
         if (!Require(!config.metalFxSpatialUpscaling, "invalid MetalFX setting was accepted")) return 1;
     }
+    {
+        std::istringstream input("[video]\nwidescreen = false\nforce_16_9 = true\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "legacy.toml");
+        if (!Require(config.forceAspect == std::optional<bool>{true} &&
+                         config.widescreen == std::optional<bool>{true} && config.legacyForceAspect,
+                     "legacy force_16_9 did not force a 16:9 game")) return 1;
+    }
+    {
+        std::istringstream input("[video]\nwidescreen = false\nforce_aspect = true\nforce_16_9 = true\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "migrated.toml");
+        if (!Require(config.forceAspect == std::optional<bool>{true} &&
+                         config.widescreen == std::optional<bool>{false} && !config.legacyForceAspect,
+                     "legacy force_16_9 overrode force_aspect")) return 1;
+    }
     if (!SetsFps("[video]\nshow_fps = false\n", "bare key was not replaced")) return 1;
     if (!SetsFps("[video]\n\"show_fps\" = false\n", "basic-quoted key was not replaced")) return 1;
     if (!SetsFps("[video]\n'show_fps'=false\n", "literal-quoted key was not replaced")) return 1;

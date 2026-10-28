@@ -114,7 +114,8 @@ bool g_skipUnreadyPipelines = RuntimeConfigFile::SkipUnreadyPipelines(true);
 bool g_vsync = RuntimeConfigFile::Vsync();
 bool g_disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
 bool g_showFps = RuntimeConfigFile::ShowFps(true);
-bool g_forceAspect169 = RuntimeConfigFile::ForceAspect169Enabled();
+bool g_forceAspect = RuntimeConfigFile::ForceAspectEnabled();
+bool g_widescreen = RuntimeConfigFile::WidescreenEnabled(true);
 #if defined(__APPLE__)
 bool g_metalFxSpatialUpscaling = RuntimeConfigFile::MetalFxSpatialUpscaling(false);
 #endif
@@ -1086,11 +1087,22 @@ void DrawAudioSettings() {
 
 void DrawGraphicsSettings() {
     g_displayMode = static_cast<int>(aurora_get_display_mode());
-    if (ImGui::Checkbox("Force 16:9", &g_forceAspect169)) {
-        SetMkwForceAspect169(g_forceAspect169);
-        RuntimeConfigFile::SetForceAspect169(g_forceAspect169);
+    if (ImGui::BeginCombo("Aspect ratio (restart required)", g_widescreen ? "16:9" : "4:3")) {
+        if (ImGui::Selectable("16:9", g_widescreen)) {
+            g_widescreen = true;
+            RuntimeConfigFile::SetWidescreen(true);
+        }
+        if (ImGui::Selectable("4:3", !g_widescreen)) {
+            g_widescreen = false;
+            RuntimeConfigFile::SetWidescreen(false);
+        }
+        ImGui::EndCombo();
     }
-    ImGui::TextDisabled("Keep a 16:9 image with black bars when the window has another shape.");
+    if (ImGui::Checkbox("Force aspect ratio", &g_forceAspect)) {
+        SetMkwForceAspect(g_forceAspect);
+        RuntimeConfigFile::SetForceAspect(g_forceAspect);
+    }
+    ImGui::TextDisabled("Keep the current aspect ratio with black bars when the window has another shape.");
     ImGui::Separator();
     struct EffectFlag {
         const char* label;
@@ -1483,6 +1495,18 @@ void DrawTopBar() {
     ImGui::EndMainMenuBar();
 }
 
+// Steam's desktop layout maps B to Escape on Valve controllers.
+bool ValveControllerConnected() {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
+    bool found = false;
+    for (int i = 0; ids != nullptr && i < count && !found; ++i) {
+        found = SDL_GetJoystickVendorForID(ids[i]) == 0x28DE && SDL_GetJoystickProductForID(ids[i]) != 0x11FF;
+    }
+    SDL_free(ids);
+    return found;
+}
+
 bool IsToggleKey(const SDL_Event& event, SDL_Scancode code) {
     return event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == code;
 }
@@ -1604,7 +1628,7 @@ void HandleEvents(const AuroraEvent* events) noexcept {
                 g_exitPromptOpen = false;
             } else if (g_topBarVisible) {
                 SetTopBarVisible(false);
-            } else {
+            } else if (!ValveControllerConnected()) {
                 g_exitPromptOpen = true;
             }
             ApplyInputBlockState();
