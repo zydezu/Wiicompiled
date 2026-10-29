@@ -300,7 +300,7 @@ inline void EnsureConfigFile() {
               "# there for the matching game texture. texture_dumps writes every\n"
               "# unmatched texture to Cache/texture_dumps under the name a\n"
               "# replacement would need. Both are read once, at startup.\n"
-              "texture_replacements = false\n"
+              "texture_replacements = true\n"
               "texture_dumps = false\n\n"
               "[audio]\n"
               "volume = 1.0\n"

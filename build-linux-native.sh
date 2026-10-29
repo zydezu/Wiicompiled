@@ -441,7 +441,7 @@ graphics_api = "auto"
 skip_unready_pipelines = true
 disable_copy_filter = true
 show_fps = true
-texture_replacements = false
+texture_replacements = true
 texture_dumps = false
 
 [audio]
